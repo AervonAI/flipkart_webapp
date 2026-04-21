@@ -1330,18 +1330,20 @@ def _compute_analytics(store):
                 prod_sku_daily[r['product']][r['sku']][d] += r['qty']
                 prod_sku_total[r['product']][r['sku']]    += r['qty']
 
-    # For each product: top 7 SKUs by total, rest = Others
+    # For each product: store top 50 SKUs by total (enough for the analysis table),
+    # rest = Others. The donut chart caps itself at 7 on the frontend.
+    SKU_STORE_LIMIT = 50
     sku_by_product = {}
     for prod, sku_totals in prod_sku_total.items():
-        top7 = sorted(sku_totals.items(), key=lambda x: -x[1])[:7]
-        top7_skus = [s for s, _ in top7]
+        top_skus_list = sorted(sku_totals.items(), key=lambda x: -x[1])[:SKU_STORE_LIMIT]
+        top_skus = [s for s, _ in top_skus_list]
         others_daily = defaultdict(int)
         for sku, day_map in prod_sku_daily[prod].items():
-            if sku not in top7_skus:
+            if sku not in top_skus:
                 for d, q in day_map.items():
                     others_daily[d] += q
         series = []
-        for sku in top7_skus:
+        for sku in top_skus:
             series.append({
                 'sku':   sku,
                 'total': prod_sku_total[prod][sku],
@@ -1720,16 +1722,11 @@ def ads_upload(account):
             store[bucket_key][key] = rows
 
         # Also keep track of overall date range in meta
-        # date_from = min across all buckets; date_to = max seen so far
-        all_buckets = [k for k in store if re.match(r'^\d{4}-\d{2}-\d{2}$', k)]
-        meta_date_from = min(all_buckets) if all_buckets else date_from
-        prev_date_to   = store.get('__meta__', {}).get('date_to', '') or ''
-        meta_date_to   = max(filter(None, [date_to, prev_date_to])) if any([date_to, prev_date_to]) else ''
         store['__meta__'] = {
             'updated_at': datetime.datetime.now(tz=IST).strftime('%d %b %Y, %H:%M IST'),
             'account':    account,
-            'date_from':  meta_date_from,
-            'date_to':    meta_date_to,
+            'date_from':  date_from,
+            'date_to':    date_to,
         }
 
         _save_ads_store(account, store)
@@ -1857,20 +1854,49 @@ def _build_ads_response(store):
     """Merge all date buckets in store into a flat data dict for the frontend."""
     meta = store.get('__meta__', {})
 
-    # Merge rows across all date buckets
+    # Merge rows across all date buckets — process in bucket date order so later
+    # buckets (newer uploads) win on overlapping dates.
     merged = {}   # report_key -> [rows]
-    bucket_dates = []
-    for bucket, reports in store.items():
-        if bucket.startswith('__'):
-            continue
+    for bucket in sorted(k for k in store if not k.startswith('__')):
+        reports = store[bucket]
         if not isinstance(reports, dict):
             continue
-        if re.match(r'^\d{4}-\d{2}-\d{2}$', bucket):
-            bucket_dates.append(bucket)
         for key, rows in reports.items():
             if key not in merged:
                 merged[key] = []
             merged[key].extend(rows)
+
+    # Deduplicate consolidated (daily) report by Campaign ID + Date.
+    # When two buckets cover overlapping dates (e.g. Mar 1–30 and Mar 29–Apr 15),
+    # the later bucket's row wins (already appended last due to sorted bucket order).
+    if 'consolidated' in merged:
+        seen = {}
+        deduped = []
+        for row in merged['consolidated']:
+            cid  = row.get('Campaign ID', '')
+            date = row.get('Date', '')
+            key  = f'{cid}|{date}'
+            seen[key] = row   # later row overwrites earlier for same key
+        merged['consolidated'] = list(seen.values())
+
+    # Also deduplicate consolidatedFSN by Campaign ID + Sku Id (period aggregate,
+    # but same SKU-campaign combo may appear in multiple bucket uploads)
+    if 'consolidatedFSN' in merged:
+        seen = {}
+        for row in merged['consolidatedFSN']:
+            key = f"{row.get('Campaign ID','')}|{row.get('Sku Id','')}"
+            if key not in seen:
+                seen[key] = {'row': row, 'revenue': 0.0, 'roi_sum': 0.0, 'count': 0}
+            seen[key]['revenue']  += float(row.get('Total Revenue (Rs.)', 0) or 0)
+            seen[key]['roi_sum']  += float(row.get('ROI', 0) or 0)
+            seen[key]['count']    += 1
+        deduped_fsn = []
+        for entry in seen.values():
+            r = dict(entry['row'])
+            r['Total Revenue (Rs.)'] = entry['revenue']
+            r['ROI'] = entry['roi_sum'] / entry['count'] if entry['count'] else 0
+            deduped_fsn.append(r)
+        merged['consolidatedFSN'] = deduped_fsn
 
     # Auto-correct common swap: if 'consolidated' lacks 'Ad Spend' but 'consolidatedFSN'
     # has it, swap them so the frontend KPI block always reads spend from 'consolidated'
@@ -1883,7 +1909,7 @@ def _build_ads_response(store):
         merged['consolidated'], merged['consolidatedFSN'] = consol_fsn, consol
 
     # Compute true full date range across all buckets
-    # date_from = earliest bucket start, date_to = latest from meta or bucket keys
+    bucket_dates = [k for k in store if re.match(r'^\d{4}-\d{2}-\d{2}$', k)]
     date_from = min(bucket_dates) if bucket_dates else meta.get('date_from', '')
     date_to   = meta.get('date_to', '') or (max(bucket_dates) if bucket_dates else '')
 
@@ -1892,7 +1918,7 @@ def _build_ads_response(store):
         'updated_at': meta.get('updated_at', ''),
         'date_from':  date_from,
         'date_to':    date_to,
-        'buckets':    sorted(bucket_dates),   # so frontend can show "X date ranges loaded"
+        'buckets':    sorted(bucket_dates),
     }
 
 # ─────────────────────────────────────────────
@@ -1906,76 +1932,19 @@ def index():
 
 @app.route('/api/master-sku-map', methods=['GET'])
 def master_sku_map():
-    """Return SKU -> ProductName mapping from master SKU file.
-
-    Response:
-      mapping      : { SKU_ID: "ProductName 1", ... }   (your internal IDs)
-      productNames : ["ProductName 1", ...]              (all unique canonical names)
-
-    The frontend uses productNames for fuzzy-matching Flipkart listing titles
-    (from FSN reports) to canonical product names for grouping in tiles/charts.
-    """
+    """Return SKU -> ProductName mapping from master SKU file."""
     if not os.path.exists(MASTER_SKU_PATH):
         return jsonify({'error': 'Master SKU not uploaded'}), 404
     try:
-        wb = openpyxl.load_workbook(MASTER_SKU_PATH, data_only=True)
-        mapping = {}        # SKU ID → ProductName 1
-        product_names = set()
-
-        for sheet in wb.worksheets:
-            rows = list(sheet.iter_rows(values_only=True))
-            if not rows:
-                continue
-            # Find header row
-            header = None
-            data_start = 0
-            for i, row in enumerate(rows):
-                norm = [str(c).strip().lower() if c else '' for c in row]
-                if any(x in norm for x in ['sku', 'sku id', 'skuid']):
-                    header = norm
-                    data_start = i + 1
-                    break
-            if not header:
-                continue
-
-            def col_idx(names):
-                for n in names:
-                    for i, h in enumerate(header):
-                        if h == n or h.startswith(n):
-                            return i
-                return None
-
-            sku_col  = col_idx(['sku', 'sku id', 'skuid'])
-            p1_col   = col_idx(['productname 1', 'productname', 'product name', 'product'])
-            p2_col   = None
-            # ProductName 2 must come after p1_col
-            if p1_col is not None:
-                for n in ['productname 2', 'productname']:
-                    for i, h in enumerate(header):
-                        if i > p1_col and (h == n or h.startswith(n)):
-                            p2_col = i
-                            break
-                    if p2_col is not None:
-                        break
-
-            if sku_col is None:
-                continue
-
-            for row in rows[data_start:]:
-                sku = str(row[sku_col]).strip() if row[sku_col] else ''
-                p1  = str(row[p1_col]).strip()  if p1_col is not None and row[p1_col] else ''
-                p2  = str(row[p2_col]).strip()  if p2_col is not None and row[p2_col] else ''
-                if sku and sku.lower() not in ('none', 'nan', '') and p1:
-                    mapping[sku] = p1
-                if p1:
-                    product_names.add(p1)
-                if p2:
-                    product_names.add(p2)
-
-        return jsonify({
-            'mapping': mapping,
-            'productNames': sorted(product_names),
-        })
+        import pandas as pd
+        df = pd.read_excel(MASTER_SKU_PATH)
+        mapping = {}
+        for _, row in df.iterrows():
+            sku = str(row.get('SKU', '')).strip()
+            p1  = str(row.get('ProductName 1', '')).strip() if pd.notna(row.get('ProductName 1')) else ''
+            if sku and p1 and sku != 'nan':
+                mapping[sku] = p1
+        return jsonify({'mapping': mapping})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2545,9 +2514,10 @@ def _register_telegram_webhook():
 
 
 # ─────────────────────────────────────────────
-# FLIPKART API OAUTH
+# FLIPKART API — CLIENT CREDENTIALS (no redirect URI needed)
 # ─────────────────────────────────────────────
 import requests as _requests
+import time as _time
 
 _FK_CLIENT_ID     = os.environ.get('FLIPKART_CLIENT_ID', '')
 _FK_CLIENT_SECRET = os.environ.get('FLIPKART_CLIENT_SECRET', '')
@@ -2561,55 +2531,61 @@ FK_TOKEN_DIR = _data_dir
 def _fk_token_path(account):
     return os.path.join(FK_TOKEN_DIR, f'fk_token_{account}.json')
 
-@app.route('/flipkart/connect/<account>')
-def flipkart_connect(account):
-    from flask import redirect, session
-    creds = FLIPKART_ACCOUNTS.get(account.lower())
-    if not creds:
-        return f"Unknown account: {account}. Known: {list(FLIPKART_ACCOUNTS.keys())}", 404
-    if not creds['client_id']:
-        return "FLIPKART_CLIENT_ID environment variable not set on Railway.", 500
-    session['fk_account'] = account.lower()
-    auth_url = (
-        "https://api.flipkart.net/oauth-service/oauth/authorize"
-        f"?client_id={creds['client_id']}"
-        "&response_type=code"
-        "&redirect_uri=https://wynx.up.railway.app/flipkart/callback"
-    )
-    return redirect(auth_url)
-
-@app.route('/flipkart/callback')
-def flipkart_callback():
-    from flask import session
-    code    = request.args.get('code')
-    account = session.get('fk_account')
-    if not code or not account:
-        return "Missing code or session. Please start from /flipkart/connect/cutestclub", 400
+def _fk_fetch_token(account):
+    """Fetch a fresh token using client_credentials GET + Basic auth (Flipkart FMS API spec)."""
     creds = FLIPKART_ACCOUNTS.get(account)
     if not creds:
-        return f"Unknown account in session: {account}", 400
-    resp = _requests.post(
-        "https://api.flipkart.net/oauth-service/oauth/token",
-        data={
-            "grant_type":    "authorization_code",
-            "code":          code,
-            "client_id":     creds['client_id'],
-            "client_secret": creds['client_secret'],
-            "redirect_uri":  "https://wynx.up.railway.app/flipkart/callback",
-        },
+        raise ValueError(f"Unknown account: {account}")
+    import base64 as _b64
+    credentials = _b64.b64encode(f"{creds['client_id']}:{creds['client_secret']}".encode()).decode()
+    resp = _requests.get(
+        "https://api.flipkart.net/oauth-service/oauth/token"
+        "?grant_type=client_credentials&scope=Seller_Api",
+        headers={"Authorization": f"Basic {credentials}"},
         timeout=15,
     )
+    resp.raise_for_status()
     token_data = resp.json()
     if 'access_token' not in token_data:
-        return jsonify({"error": "Token exchange failed", "details": token_data}), 500
+        raise RuntimeError(f"Token fetch failed: {token_data}")
     token_data['connected_at'] = datetime.datetime.now(tz=IST).isoformat()
+    token_data['fetched_at_ts'] = _time.time()
     with open(_fk_token_path(account), 'w') as f:
         json.dump(token_data, f)
-    return (
-        f"<h2>Connected!</h2>"
-        f"<p>Account <b>{account}</b> is now linked to Flipkart API.</p>"
-        f"<p><a href='/flipkart/status'>Check status</a></p>"
-    )
+    return token_data
+
+def fk_get_token(account):
+    """Return a valid access token, auto-refreshing 5 min before expiry."""
+    token_path = _fk_token_path(account)
+    if os.path.exists(token_path):
+        try:
+            with open(token_path) as f:
+                t = json.load(f)
+            expires_in = int(t.get('expires_in', 3600))
+            fetched_at = float(t.get('fetched_at_ts', 0))
+            if _time.time() < fetched_at + expires_in - 300:
+                return t['access_token']
+        except Exception:
+            pass
+    return _fk_fetch_token(account)['access_token']
+
+@app.route('/flipkart/connect/<account>')
+def flipkart_connect(account):
+    """Get a Flipkart token using client_credentials — no portal redirect URI needed."""
+    account = account.lower()
+    if account not in FLIPKART_ACCOUNTS:
+        return f"Unknown account: {account}. Known: {list(FLIPKART_ACCOUNTS.keys())}", 404
+    if not FLIPKART_ACCOUNTS[account]['client_id']:
+        return "FLIPKART_CLIENT_ID environment variable not set on Railway.", 500
+    try:
+        _fk_fetch_token(account)
+        return (
+            f"<h2>Connected!</h2>"
+            f"<p>Account <b>{account}</b> is now linked to Flipkart API.</p>"
+            f"<p><a href='/flipkart/status'>Check status</a></p>"
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/flipkart/status')
 def flipkart_status():
