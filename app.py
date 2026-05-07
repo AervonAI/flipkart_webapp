@@ -2524,6 +2524,10 @@ _FK_CLIENT_SECRET = os.environ.get('FLIPKART_CLIENT_SECRET', '')
 
 FLIPKART_ACCOUNTS = {
     "cutestclub": {"client_id": _FK_CLIENT_ID, "client_secret": _FK_CLIENT_SECRET},
+    "eonspark":   {
+        "client_id":     os.environ.get('EONSPARK_CLIENT_ID', ''),
+        "client_secret": os.environ.get('EONSPARK_CLIENT_SECRET', ''),
+    },
 }
 
 FK_TOKEN_DIR = _data_dir
@@ -2609,6 +2613,113 @@ def flipkart_status():
                 "connect_url": f"https://wynx.up.railway.app/flipkart/connect/{account}",
             }
     return jsonify(statuses)
+
+@app.route('/api/category-investigate')
+def category_investigate():
+    """
+    Run the Flipkart category attribute investigation for Body & Skin Care / Foot Care.
+    Uses EONSPARK account. Returns full category tree + attributes as JSON.
+    Query params:
+      ?account=eonspark (default)
+      ?keywords=foot,skin,body (comma-separated, default: foot,body,skin,health,personal,care)
+    """
+    account = request.args.get('account', 'eonspark').lower()
+    if account not in FLIPKART_ACCOUNTS:
+        return jsonify({"error": f"Unknown account '{account}'. Known: {list(FLIPKART_ACCOUNTS.keys())}"}), 400
+    if not FLIPKART_ACCOUNTS[account]['client_id']:
+        return jsonify({"error": f"Credentials for '{account}' not set. Add {account.upper()}_CLIENT_ID and {account.upper()}_CLIENT_SECRET to Railway env vars."}), 500
+
+    FK_API = "https://api.flipkart.net/sellers"
+    keywords_param = request.args.get('keywords', 'foot,body,skin,health,personal,care')
+    search_keywords = [k.strip() for k in keywords_param.split(',') if k.strip()]
+
+    try:
+        token = fk_get_token(account)
+    except Exception as e:
+        return jsonify({"error": f"Token fetch failed: {e}"}), 502
+
+    def fk_get(path, params=None):
+        r = _requests.get(
+            f"{FK_API}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=20,
+        )
+        return {"status": r.status_code, "body": r.json() if r.headers.get('content-type','').startswith('application/json') else r.text}
+
+    def find_categories(cats, keyword):
+        results = []
+        for cat in (cats if isinstance(cats, list) else []):
+            name = (cat.get("displayName") or cat.get("name") or "").lower()
+            if keyword.lower() in name:
+                results.append(cat)
+            children = cat.get("children") or cat.get("subCategories") or []
+            results.extend(find_categories(children, keyword))
+        return results
+
+    def collect_target_ids(cats, target_kws, depth=0):
+        found = []
+        for cat in (cats if isinstance(cats, list) else []):
+            name = (cat.get("displayName") or cat.get("name") or "").lower()
+            cat_id = cat.get("id") or cat.get("categoryId") or ""
+            if any(kw in name for kw in target_kws) and cat_id:
+                found.append({"name": name, "id": cat_id, "depth": depth})
+            children = cat.get("children") or cat.get("subCategories") or []
+            found.extend(collect_target_ids(children, target_kws, depth + 1))
+        return found
+
+    # 1. Fetch category tree
+    cats_resp = fk_get("/skus/categories")
+    if cats_resp["status"] != 200:
+        return jsonify({"error": "Failed to fetch categories", "detail": cats_resp}), 502
+    cats = cats_resp["body"]
+
+    # 2. Find matching categories
+    keyword_matches = {}
+    for kw in search_keywords:
+        matches = find_categories(cats, kw)
+        if matches:
+            keyword_matches[kw] = [
+                {"name": c.get("displayName") or c.get("name"), "id": c.get("id") or c.get("categoryId")}
+                for c in matches[:8]
+            ]
+
+    # 3. Collect target category IDs to probe
+    target_cats = collect_target_ids(cats, search_keywords)[:15]  # cap at 15
+
+    # 4. Fetch attributes for each target category
+    SEO_FLAGS = {"keyword", "search", "highlight", "tag", "description", "bullet", "feature", "benefit", "meta"}
+    attributes_by_category = {}
+    for cat_info in target_cats:
+        attrs_resp = fk_get(f"/skus/categories/{cat_info['id']}/attributes")
+        attrs = attrs_resp["body"]
+        parsed = []
+        if isinstance(attrs, list):
+            for attr in attrs:
+                attr_name = attr.get("name", "")
+                is_seo = any(f in attr_name.lower() for f in SEO_FLAGS)
+                parsed.append({
+                    "name":      attr_name,
+                    "type":      attr.get("type") or attr.get("dataType", ""),
+                    "mandatory": attr.get("mandatory") or attr.get("required", False),
+                    "seo_field": is_seo,
+                    "values":    (attr.get("values") or attr.get("allowedValues") or [])[:20],
+                })
+        attributes_by_category[cat_info["name"]] = {
+            "category_id": cat_info["id"],
+            "http_status": attrs_resp["status"],
+            "attributes":  parsed,
+            "seo_fields":  [a["name"] for a in parsed if a["seo_field"]],
+        }
+
+    return jsonify({
+        "account":              account,
+        "categories_fetched":   len(cats) if isinstance(cats, list) else "non-list",
+        "keyword_matches":      keyword_matches,
+        "target_categories":    [c["name"] for c in target_cats],
+        "attributes_by_category": attributes_by_category,
+    })
+
 
 if __name__ == '__main__':
     import os
