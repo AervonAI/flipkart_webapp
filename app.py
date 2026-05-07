@@ -27,7 +27,6 @@ from reportlab.lib.units import mm
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'wynx-dev-key-change-in-prod')
 app.config['MAX_CONTENT_LENGTH'] = 80 * 1024 * 1024  # 80 MB upload cap — protects against OOM on Railway free tier
 
 # Persistent master SKU file — stored in /data (Railway Volume) so it survives restarts
@@ -43,6 +42,122 @@ OUTPUTS_META = os.path.join(_data_dir, 'outputs_meta.json')  # timestamp + stats
 KNOWN_ACCOUNTS = ['REFRESHWAVE', 'EONSPARK', 'CUTEST CLUB', 'HELLOHI']
 ORDER_DB_PATH  = os.path.join(_data_dir, 'order_db.json')  # persistent order ID history
 ORDER_DB_TTL   = 72 * 3600  # 3 days in seconds
+
+# ─────────────────────────────────────────────
+# FLIPKART API — TOKEN MANAGER
+# ─────────────────────────────────────────────
+# Credentials live in Railway env vars — never hardcoded.
+# One account supported so far: CUTEST CLUB (Eonspark creds pending).
+# Add more accounts by setting FK_<ACCOUNT>_APP_ID / FK_<ACCOUNT>_APP_SECRET.
+# Account name key: spaces replaced with underscores, uppercased.
+#   e.g. "CUTEST CLUB" → FK_CUTEST_CLUB_APP_ID
+
+FK_TOKEN_CACHE_PATH = os.path.join(_data_dir, 'fk_tokens.json')
+FK_API_BASE         = 'https://api.flipkart.net'
+FK_REFRESH_BUFFER   = 24 * 3600   # refresh token if less than 24 h remaining
+
+def _fk_env_key(account):
+    """Convert account name to env var prefix. 'CUTEST CLUB' → 'FK_CUTEST_CLUB'"""
+    return 'FK_' + account.upper().replace(' ', '_')
+
+def _fk_credentials(account):
+    """Return (app_id, app_secret) from env vars, or (None, None) if not set."""
+    prefix = _fk_env_key(account)
+    return os.environ.get(f'{prefix}_APP_ID'), os.environ.get(f'{prefix}_APP_SECRET')
+
+def _fk_load_token_cache():
+    if not os.path.exists(FK_TOKEN_CACHE_PATH):
+        return {}
+    try:
+        with open(FK_TOKEN_CACHE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _fk_save_token_cache(cache):
+    tmp = FK_TOKEN_CACHE_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(cache, f)
+    os.replace(tmp, FK_TOKEN_CACHE_PATH)
+
+def fk_get_token(account):
+    """
+    Return a valid access token for the given account.
+    Fetches a new one if none cached or within 24 h of expiry.
+    Raises RuntimeError if credentials are not configured.
+    """
+    import requests as _req, base64 as _b64
+
+    app_id, app_secret = _fk_credentials(account)
+    if not app_id or not app_secret:
+        prefix = _fk_env_key(account)
+        raise RuntimeError(
+            f'Flipkart credentials not configured for {account}. '
+            f'Set {prefix}_APP_ID and {prefix}_APP_SECRET in Railway env vars.'
+        )
+
+    cache = _fk_load_token_cache()
+    entry = cache.get(account, {})
+    now   = datetime.datetime.now(tz=datetime.timezone.utc).timestamp()
+
+    # Return cached token if still valid with buffer
+    if entry.get('access_token') and entry.get('expires_at', 0) - now > FK_REFRESH_BUFFER:
+        return entry['access_token']
+
+    # Fetch fresh token
+    creds = _b64.b64encode(f'{app_id}:{app_secret}'.encode()).decode()
+    resp  = _req.get(
+        f'{FK_API_BASE}/oauth-service/oauth/token',
+        params={'grant_type': 'client_credentials', 'scope': 'Seller_Api'},
+        headers={'Authorization': f'Basic {creds}'},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f'Flipkart token fetch failed [{resp.status_code}]: {resp.text[:200]}')
+
+    data        = resp.json()
+    access_token = data['access_token']
+    expires_in   = int(data.get('expires_in', 3600))
+
+    # Persist to cache
+    cache[account] = {
+        'access_token': access_token,
+        'expires_at':   now + expires_in,
+        'fetched_at':   datetime.datetime.now(tz=IST).strftime('%d %b %Y, %H:%M IST'),
+    }
+    _fk_save_token_cache(cache)
+    print(f'[FK Token] Refreshed token for {account}, expires in {expires_in//3600}h')
+    return access_token
+
+def fk_api_get(account, path, params=None):
+    """Make an authenticated GET request to the Flipkart seller API."""
+    import requests as _req
+    token = fk_get_token(account)
+    resp  = _req.get(
+        f'{FK_API_BASE}{path}',
+        params=params or {},
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type':  'application/json',
+        },
+        timeout=30,
+    )
+    return resp
+
+def fk_api_post(account, path, payload=None):
+    """Make an authenticated POST request to the Flipkart seller API."""
+    import requests as _req
+    token = fk_get_token(account)
+    resp  = _req.post(
+        f'{FK_API_BASE}{path}',
+        json=payload or {},
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type':  'application/json',
+        },
+        timeout=30,
+    )
+    return resp
 
 def _atomic_copy(src, dst):
     """Copy src → dst atomically using a temp file + rename to avoid partial writes."""
@@ -1118,6 +1233,19 @@ def _extract_product(sku):
     s = re.sub(r'\s+(ES|RW|CC|HH)\s*$', '', s, flags=re.IGNORECASE).strip()
     return s or sku
 
+
+def _fix_next_url(raw):
+    """Normalise Flipkart's nextPageUrl which is sometimes a relative path."""
+    if not raw:
+        return None
+    if raw.startswith('http'):
+        return raw
+    if raw.startswith('/sellers'):
+        return f'{FK_API_BASE}{raw}'
+    if raw.startswith('/'):
+        return f'{FK_API_BASE}/sellers{raw}'
+    return f'{FK_API_BASE}/sellers/{raw}'
+
 def _df_to_store_rows(df):
     """Convert a filtered DataFrame to a {date_str: [row,...]} dict."""
     import pandas as pd
@@ -1133,8 +1261,62 @@ def _df_to_store_rows(df):
             'ret_sub':    str(r.get('return_sub_reason','')) if str(r.get('return_sub_reason','')) != 'nan' else '',
             'disp_breach':str(r.get('dispatch_sla_breached','')),
             'dlv_breach': str(r.get('delivery_sla_breached','')),
+            'revenue':    float(r['selling_price']) * int(r.get('quantity', 1))
+                          if 'selling_price' in df.columns and not pd.isna(r.get('selling_price'))
+                          else 0.0,
         })
     return dict(store)
+
+
+# ─────────────────────────────────────────────
+# FLIPKART API — SALES SYNC HELPERS
+# ─────────────────────────────────────────────
+
+def _fk_compute_sla_breach(dispatch_by, dispatched_on, deliver_by, delivered_on):
+    """Derive SLA breach flags from raw date strings. Returns ('Y'|'N'|'', 'Y'|'N'|'')"""
+    def _parse(s):
+        if not s: return None
+        for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try: return datetime.datetime.strptime(str(s)[:19], fmt)
+            except Exception: pass
+        return None
+    db  = _parse(dispatch_by);   don  = _parse(dispatched_on)
+    dlb = _parse(deliver_by);    dlon = _parse(delivered_on)
+    disp_breach = ('Y' if don > db else 'N') if db and don else ''
+    dlv_breach  = ('Y' if dlon > dlb else 'N') if dlb and dlon else ''
+    return disp_breach, dlv_breach
+
+
+def _fk_item_to_store_row(item, product_resolver):
+    """Convert one orderItem dict from Flipkart API into our store row format."""
+    sku_raw   = item.get('sku', '')
+    sku_clean = re.sub(r'^"""SKU:|"""$', '', sku_raw).strip().strip('"')
+    product   = product_resolver(sku_clean)
+    qty       = int(item.get('quantity', 1))
+    status    = item.get('status', '')
+    price_comp = item.get('priceComponents', {}) or {}
+    unit_price = float(price_comp.get('sellingPrice') or price_comp.get('customerPrice') or 0)
+    revenue    = unit_price * qty
+    ret_reason = (item.get('cancellationReason', '') or '').lower()
+    ret_sub    = item.get('cancellationSubReason', '') or ''
+    disp_breach, dlv_breach = _fk_compute_sla_breach(
+        item.get('dispatchByDate') or item.get('dispatch_by_date') or item.get('__dispatchByDate'),
+        item.get('dispatchedDate') or item.get('dispatched_date') or item.get('__dispatchedDate'),
+        item.get('deliverByDate')  or item.get('deliver_by_date') or item.get('__deliverByDate'),
+        item.get('deliveryDate')   or item.get('order_delivery_date') or item.get('__deliveryDate'),
+    )
+    order_date = item.get('orderDate', '') or item.get('order_date', '')
+    # Handle Unix ms timestamps (13-digit numbers)
+    if isinstance(order_date, (int, float)) or (isinstance(order_date, str) and str(order_date).isdigit() and len(str(order_date)) > 10):
+        date_str = datetime.datetime.fromtimestamp(int(order_date)/1000, tz=IST).strftime('%Y-%m-%d')
+    else:
+        date_str = str(order_date)[:10] if order_date else ''
+    return date_str, {
+        'order_item_id': item.get('orderItemId', ''),   # for deduplication on merge
+        'sku': sku_clean, 'product': product, 'qty': qty, 'status': status,
+        'ret_reason': ret_reason, 'ret_sub': ret_sub,
+        'disp_breach': disp_breach, 'dlv_breach': dlv_breach, 'revenue': revenue,
+    }
 
 def _is_genuine_return(row, valid_reasons):
     """A RETURNED row is a genuine return only if its reason is in valid_reasons.
@@ -1146,15 +1328,20 @@ def _is_genuine_return(row, valid_reasons):
 
 def _compute_analytics(store):
     """Compute KPIs + chart data from a {date_str: [row,...]} store dict."""
-    ACTIVE    = {'DELIVERED','READY_TO_SHIP','APPROVED','APPROVAL_HOLD'}
-    RETURNED  = {'RETURNED'}
-    CANCELLED = {'CANCELLED','RETURN_REQUESTED'}
+    # Filter out internal __ keys before processing
+    store = {k: v for k, v in store.items() if not k.startswith('__')}
+
+    ACTIVE    = {'DELIVERED','READY_TO_SHIP','APPROVED','APPROVAL_HOLD','SHIPPED','READY_TO_DISPATCH','PACKED','PACKING_IN_PROGRESS'}
+    RETURNED  = {'RETURNED', 'RETURN_REQUESTED'}
+    CANCELLED = {'CANCELLED','RETURN_REQUESTED','REJECTED'}
     # Only these return reasons count as genuine returns; all others → cancellation
+    # For API-sourced data where ret_reason is empty, treat all RETURNED status as genuine
     VALID_RETURN_REASONS = {
         'orc_validated with customer',
         'quality_issue',
         'missing_item',
         'customer rejection',
+        '',  # API data often has no reason — count RETURNED status as genuine return
     }
 
     all_rows = [r for rows in store.values() for r in rows]
@@ -1170,6 +1357,8 @@ def _compute_analytics(store):
     delivery_breach = sum(1 for r in all_rows if r['dlv_breach']  == 'Y')
     dispatched_tot  = sum(1 for r in all_rows if r['disp_breach'] in ('Y','N'))
     delivered_tot   = sum(1 for r in all_rows if r['dlv_breach']  in ('Y','N'))
+    # Revenue — sum sellingPrice × qty for active (non-cancelled, non-returned) orders
+    total_revenue   = sum(r.get('revenue', 0) for r in all_rows if r['status'] in ACTIVE)
 
     all_dates  = sorted(store.keys())
     date_from  = all_dates[0]  if all_dates else ''
@@ -1178,6 +1367,7 @@ def _compute_analytics(store):
     kpis = {
         'total_orders':        len(all_rows),
         'total_units':         total_units,
+        'total_revenue':       round(total_revenue, 2),
         'delivered':           delivered,
         'returned':            returned_cnt,
         'cancelled':           cancelled_cnt,
@@ -1193,15 +1383,22 @@ def _compute_analytics(store):
     # Product trend + returns/cancels — single pass for all per-product daily data
     prod_day          = defaultdict(lambda: defaultdict(int))
     prod_total        = defaultdict(int)
+    prod_revenue      = defaultdict(float)          # product → total revenue
+    prod_rev_daily    = defaultdict(lambda: defaultdict(float))  # product → date → revenue
     prod_ret_daily    = defaultdict(lambda: defaultdict(int))
     prod_cancel_daily = defaultdict(lambda: defaultdict(int))
     prod_orders_daily = defaultdict(lambda: defaultdict(int))
+    daily_revenue     = defaultdict(float)          # date → revenue
     for d, rows in store.items():
         for r in rows:
             prod_orders_daily[r['product']][d] += r['qty']
             if r['status'] in ACTIVE:
                 prod_day[r['product']][d]   += r['qty']
                 prod_total[r['product']]    += r['qty']
+                rev = r.get('revenue', 0)
+                prod_revenue[r['product']]         += rev
+                prod_rev_daily[r['product']][d]    += rev
+                daily_revenue[d]                   += rev
             if _is_genuine_return(r, VALID_RETURN_REASONS):
                 prod_ret_daily[r['product']][d] += r['qty']
             elif r['status'] in CANCELLED or r['status'] in RETURNED:
@@ -1215,6 +1412,8 @@ def _compute_analytics(store):
             'data':        {d: prod_day[prod].get(d, 0) for d in all_dates},
             'data_ret':    {d: prod_ret_daily[prod].get(d, 0) for d in all_dates},
             'data_cancel': {d: prod_cancel_daily[prod].get(d, 0) for d in all_dates},
+            'revenue':     round(prod_revenue.get(prod, 0), 2),
+            'rev_daily':   {d: round(prod_rev_daily[prod].get(d, 0), 2) for d in all_dates},
         })
 
     # Returns chart
@@ -1316,28 +1515,30 @@ def _compute_analytics(store):
             'returns': daily_returns.get(d, 0),
             'cancels': daily_cancels.get(d, 0),
             'orders':  daily_orders.get(d, 0),
+            'revenue': round(daily_revenue.get(d, 0), 2),
         }
         for d in all_dates
     ]
 
     # ── SKU breakdown per product (active orders only) ──────────────────────
-    # Structure: { product: { sku: {total, daily: {date: qty}} } }
-    prod_sku_daily = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    prod_sku_total = defaultdict(lambda: defaultdict(int))
+    # Structure: { product: { sku: {total, daily: {date: qty}, revenue} } }
+    prod_sku_daily   = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    prod_sku_total   = defaultdict(lambda: defaultdict(int))
+    prod_sku_revenue = defaultdict(lambda: defaultdict(float))
     for d, rows in store.items():
         for r in rows:
             if r['status'] in ACTIVE:
-                prod_sku_daily[r['product']][r['sku']][d] += r['qty']
-                prod_sku_total[r['product']][r['sku']]    += r['qty']
+                prod_sku_daily[r['product']][r['sku']][d]   += r['qty']
+                prod_sku_total[r['product']][r['sku']]      += r['qty']
+                prod_sku_revenue[r['product']][r['sku']]    += r.get('revenue', 0)
 
-    # For each product: store top 50 SKUs by total (enough for the analysis table),
-    # rest = Others. The donut chart caps itself at 7 on the frontend.
+    # For each product: store top 50 SKUs (table needs all; donut/line cap at 7 on frontend)
     SKU_STORE_LIMIT = 50
     sku_by_product = {}
     for prod, sku_totals in prod_sku_total.items():
         top_skus_list = sorted(sku_totals.items(), key=lambda x: -x[1])[:SKU_STORE_LIMIT]
-        top_skus = [s for s, _ in top_skus_list]
-        others_daily = defaultdict(int)
+        top_skus      = [s for s, _ in top_skus_list]
+        others_daily  = defaultdict(int)
         for sku, day_map in prod_sku_daily[prod].items():
             if sku not in top_skus:
                 for d, q in day_map.items():
@@ -1345,15 +1546,17 @@ def _compute_analytics(store):
         series = []
         for sku in top_skus:
             series.append({
-                'sku':   sku,
-                'total': prod_sku_total[prod][sku],
-                'daily': {d: prod_sku_daily[prod][sku].get(d, 0) for d in all_dates},
+                'sku':     sku,
+                'total':   prod_sku_total[prod][sku],
+                'revenue': round(prod_sku_revenue[prod].get(sku, 0), 2),
+                'daily':   {d: prod_sku_daily[prod][sku].get(d, 0) for d in all_dates},
             })
         if others_daily:
             series.append({
-                'sku':   'Others',
-                'total': sum(others_daily.values()),
-                'daily': {d: others_daily.get(d, 0) for d in all_dates},
+                'sku':     'Others',
+                'total':   sum(others_daily.values()),
+                'revenue': 0.0,
+                'daily':   {d: others_daily.get(d, 0) for d in all_dates},
             })
         sku_by_product[prod] = series
 
@@ -1361,6 +1564,7 @@ def _compute_analytics(store):
         'kpis':               kpis,
         'trend_dates':        all_dates,
         'trend_series':       trend_series,
+        'daily_revenue':      {d: round(daily_revenue.get(d, 0), 2) for d in all_dates},
         'returns_chart':      returns_chart,
         'returns_by_product': returns_by_product,
         'returns_drill':      returns_drill,
@@ -1368,6 +1572,278 @@ def _compute_analytics(store):
         'cancels_by_product': cancels_by_product,
         'daily_stats':        daily_stats,
         'sku_by_product':     sku_by_product,
+    }
+
+
+
+def _fk_sync_sales(account, full_resync=False):
+    """
+    Fetch recent shipments from Flipkart API and merge into the persistent sales store.
+    If full_resync=True, wipes the store first and fetches the full 60-day window.
+    Otherwise incremental — only fetches dates after the latest date already stored (minus 2-day buffer).
+    """
+    import requests as _req
+
+    token   = fk_get_token(account)
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    base_url = f'{FK_API_BASE}/sellers/v3/shipments/filter/'
+
+    now_ist   = datetime.datetime.now(tz=IST)
+    cutoff    = (now_ist - datetime.timedelta(days=SALES_TTL_DAYS)).strftime('%Y-%m-%d')
+
+    store     = _load_sales_store(account)
+    store     = _prune_old_dates(store)
+    if full_resync:
+        # Full re-sync: fetch the entire 60-day window but KEEP existing rows —
+        # upsert will overwrite stale API rows while preserving XLSX-uploaded history
+        fetch_from = cutoff
+    else:
+        existing_dates = [k for k in store if not k.startswith('__')]
+        if existing_dates:
+            latest     = max(existing_dates)
+            fetch_from = (datetime.datetime.strptime(latest, '%Y-%m-%d')
+                          - datetime.timedelta(days=2)).strftime('%Y-%m-%d')
+        else:
+            fetch_from = cutoff
+    fetch_to = now_ist.strftime('%Y-%m-%d')
+
+    # Build product resolver
+    sku_to_product = {}
+    if os.path.exists(MASTER_SKU_PATH):
+        try:
+            with open(MASTER_SKU_PATH, 'rb') as f:
+                master = load_sku_master(f.read())
+            acct_master = get_account_master(master, account)
+            for sku, info in acct_master.items():
+                if info.get('product'):
+                    sku_to_product[sku] = info['product']
+        except Exception as me:
+            print(f'[FKSync] Master SKU load failed: {me}')
+
+    def resolve_product(sku_clean):
+        def norm(s): return s.strip().title()
+        if sku_clean in sku_to_product: return norm(sku_to_product[sku_clean])
+        stripped = re.sub(r'\s*(Pack\s*\d+\w*|PCK\d*|\d+\s*PCK)\s*$', '', sku_clean, flags=re.IGNORECASE).strip()
+        if stripped != sku_clean and stripped in sku_to_product: return norm(sku_to_product[stripped])
+        for ms_key, prod_name in sku_to_product.items():
+            ms = re.sub(r'\s*(Pack\s*\d+\w*|PCK\d*|\d+\s*PCK)\s*$', '', ms_key, flags=re.IGNORECASE).strip()
+            if ms and (ms == stripped or ms == sku_clean): return norm(prod_name)
+        return norm(stripped) if stripped else sku_clean
+
+    new_rows      = defaultdict(list)
+    total_fetched = 0
+
+    # --- preDispatch: APPROVED, READY_TO_DISPATCH, PACKED (active unfulfilled orders) ---
+    # Note: preDispatch filter does not support orderDate filter — fetch all and filter in Python
+    payload = {
+        'filter': {
+            'type':   'preDispatch',
+            'states': ['APPROVED', 'READY_TO_DISPATCH', 'PACKED', 'PACKING_IN_PROGRESS'],
+            'locationId': FK_AUTO_DISPATCH_LOCATION,
+        },
+        'pagination': {'pageSize': 20},
+    }
+    next_url = base_url
+    fetched  = 0
+    while next_url and fetched < 5000:
+        try:
+            r = (_req.post(next_url, json=payload, headers=headers, timeout=30)
+                 if next_url == base_url
+                 else _req.get(next_url, headers=headers, timeout=30))
+            if r.status_code != 200:
+                print(f'[FKSync] preDispatch {r.status_code}: {r.text[:200]}')
+                break
+            data = r.json()
+            for shipment in data.get('shipments', []):
+                raw_sd = shipment.get('orderDate', '')
+                if isinstance(raw_sd, (int, float)) or (isinstance(raw_sd, str) and str(raw_sd).isdigit() and len(str(raw_sd)) > 10):
+                    shipment_date = datetime.datetime.fromtimestamp(int(raw_sd)/1000, tz=IST).strftime('%Y-%m-%d')
+                else:
+                    shipment_date = str(raw_sd)[:10] if raw_sd else ''
+                # preDispatch shipments often have no orderDate — use dispatchAfterDate - 1 day as proxy
+                if not shipment_date:
+                    for date_field in ['dispatchAfterDate', 'dispatchByDate', 'updatedAt']:
+                        alt = str(shipment.get(date_field, ''))
+                        if alt and len(alt) >= 10:
+                            try:
+                                proxy = (datetime.datetime.strptime(alt[:10], '%Y-%m-%d')
+                                         - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+                                shipment_date = proxy
+                            except Exception:
+                                shipment_date = alt[:10]
+                            break
+                # Final fallback: use today
+                if not shipment_date:
+                    shipment_date = datetime.datetime.now(tz=IST).strftime('%Y-%m-%d')
+                if fetched < 3:
+                    print(f'[FKSync] preDispatch sample orderDate={repr(raw_sd)} resolved={shipment_date}')
+                for item in shipment.get('orderItems', []):
+                    # Log first item keys to see what date fields are available
+                    if fetched == 0:
+                        print(f'[FKSync] preDispatch item keys: {list(item.keys())[:12]}')
+                    # Inject shipment-level fields if item-level is missing
+                    inject = {}
+                    if not item.get('orderDate') and not item.get('order_date') and shipment_date:
+                        inject['orderDate'] = shipment_date
+                    for sla_field in ['dispatchByDate','dispatchedDate','deliverByDate','deliveryDate']:
+                        if not item.get(sla_field) and shipment.get(sla_field):
+                            inject[sla_field] = shipment[sla_field]
+                    if inject:
+                        item = {**item, **inject}
+                    ds, row = _fk_item_to_store_row(item, resolve_product)
+                    if ds and ds >= cutoff:
+                        new_rows[ds].append(row)
+                        fetched += 1
+            if not data.get('hasMore') or not data.get('nextPageUrl'):
+                break
+            next_url = _fix_next_url(data['nextPageUrl'])
+        except Exception as e:
+            print(f'[FKSync] preDispatch error: {e}')
+            break
+    total_fetched += fetched
+    print(f'[FKSync] preDispatch → {fetched} items')
+
+    # --- postDispatch: SHIPPED + DELIVERED ---
+    for state_list in [['SHIPPED', 'DELIVERED', 'READY_TO_SHIP']]:
+        payload  = {
+            'filter': {
+                'type': 'postDispatch', 'states': state_list,
+                'orderDate': {
+                    'from': f'{fetch_from}T00:00:00+05:30',
+                    'to':   f'{fetch_to}T23:59:59+05:30',
+                },
+            },
+            'pagination': {'pageSize': 20},
+        }
+        next_url = base_url
+        fetched  = 0
+        while next_url and fetched < 5000:
+            try:
+                r = (_req.post(next_url, json=payload, headers=headers, timeout=30)
+                     if next_url == base_url
+                     else _req.get(next_url, headers=headers, timeout=30))
+                if r.status_code != 200:
+                    print(f'[FKSync] postDispatch {r.status_code}: {r.text[:200]}')
+                    break
+                data = r.json()
+                for shipment in data.get('shipments', []):
+                    raw_sd = shipment.get('orderDate', '')
+                    if isinstance(raw_sd, (int, float)) or (isinstance(raw_sd, str) and str(raw_sd).isdigit() and len(str(raw_sd)) > 10):
+                        import datetime as _dt
+                        shipment_date = _dt.datetime.fromtimestamp(int(raw_sd)/1000, tz=IST).strftime('%Y-%m-%d')
+                    else:
+                        shipment_date = str(raw_sd)[:10] if raw_sd else ''
+                    if fetched < 2:
+                        print(f'[FKSync] postDispatch shipment keys: {list(shipment.keys())}')
+                        print(f'[FKSync] postDispatch SLA fields: { {f: shipment.get(f) for f in ["dispatchByDate","dispatchedDate","deliverByDate","deliveryDate"]} }')
+                    for item in shipment.get('orderItems', []):
+                        inject = {}
+                        if not item.get('orderDate') and shipment_date:
+                            inject['orderDate'] = shipment_date
+                        for sla_field in ['dispatchByDate','dispatchedDate','deliverByDate','deliveryDate']:
+                            if not item.get(sla_field) and shipment.get(sla_field):
+                                inject[sla_field] = shipment[sla_field]
+                        if inject:
+                            item = {**item, **inject}
+                        ds, row = _fk_item_to_store_row(item, resolve_product)
+                        if ds and ds >= cutoff:
+                            new_rows[ds].append(row)
+                            fetched += 1
+                if not data.get('hasMore') or not data.get('nextPageUrl'):
+                    break
+                next_url = _fix_next_url(data['nextPageUrl'])
+            except Exception as e:
+                print(f'[FKSync] postDispatch error: {e}')
+                break
+        total_fetched += fetched
+        print(f'[FKSync] postDispatch → {fetched} items')
+
+    # --- cancelled orders (all 3 cancellation types) ---
+    for ctype in ['buyerCancellation', 'sellerCancellation', 'marketplaceCancellation']:
+        payload = {
+            'filter': {
+                'type': 'cancelled', 'states': ['CANCELLED'],
+                'cancellationType': ctype,
+                'cancellationDate': {
+                    'from': f'{fetch_from}T00:00:00+05:30',
+                    'to':   f'{fetch_to}T23:59:59+05:30',
+                },
+            },
+            'pagination': {'pageSize': 20},
+        }
+        next_url = base_url
+        fetched  = 0
+        while next_url and fetched < 5000:
+            try:
+                r = (_req.post(next_url, json=payload, headers=headers, timeout=30)
+                     if next_url == base_url
+                     else _req.get(next_url, headers=headers, timeout=30))
+                if r.status_code != 200: break
+                data = r.json()
+                for shipment in data.get('shipments', []):
+                    raw_sd = shipment.get('orderDate', '')
+                    if isinstance(raw_sd, (int, float)) or (isinstance(raw_sd, str) and str(raw_sd).isdigit() and len(str(raw_sd)) > 10):
+                        import datetime as _dt
+                        shipment_date = _dt.datetime.fromtimestamp(int(raw_sd)/1000, tz=IST).strftime('%Y-%m-%d')
+                    else:
+                        shipment_date = str(raw_sd)[:10] if raw_sd else ''
+                    for item in shipment.get('orderItems', []):
+                        inject = {}
+                        if not item.get('orderDate') and shipment_date:
+                            inject['orderDate'] = shipment_date
+                        for sla_field in ['dispatchByDate','dispatchedDate','deliverByDate','deliveryDate']:
+                            if not item.get(sla_field) and shipment.get(sla_field):
+                                inject[sla_field] = shipment[sla_field]
+                        if inject:
+                            item = {**item, **inject}
+                        ds, row = _fk_item_to_store_row(item, resolve_product)
+                        if ds and ds >= cutoff:
+                            new_rows[ds].append(row)
+                            fetched += 1
+                if not data.get('hasMore') or not data.get('nextPageUrl'):
+                    break
+                next_url = _fix_next_url(data['nextPageUrl'])
+            except Exception as e:
+                print(f'[FKSync] {ctype} error: {e}')
+                break
+        total_fetched += fetched
+        print(f'[FKSync] {ctype} → {fetched} items')
+
+    # Note: RETURNED status is not supported by the postDispatch filter API.
+    # Returns data comes from the XLSX upload. Skipping returns API fetch.
+    print(f'[FKSync] returns → skipped (not supported by API)')
+
+    # Merge new_rows into store — upsert by order_item_id so we never lose existing orders.
+    # For each date: build a map of existing rows keyed by order_item_id, then overwrite
+    # with fresh API rows (which have updated status), keeping any rows the API didn't return.
+    for d, api_rows in new_rows.items():
+        existing = store.get(d, [])
+        # Index existing rows by order_item_id (rows without one are kept as-is)
+        indexed = {r['order_item_id']: r for r in existing if r.get('order_item_id')}
+        unkeyed = [r for r in existing if not r.get('order_item_id')]
+        # Overwrite/add API rows
+        for row in api_rows:
+            oid = row.get('order_item_id', '')
+            if oid:
+                indexed[oid] = row
+            else:
+                unkeyed.append(row)
+        store[d] = list(indexed.values()) + unkeyed
+
+    store['__meta__'] = {
+        'updated_at':   now_ist.strftime('%d %b %Y, %H:%M IST'),
+        'account':      account,
+        'sync_method':  'api',
+        'fetch_from':   fetch_from,
+        'fetch_to':     fetch_to,
+    }
+    _save_sales_store(account, store)
+
+    return {
+        'ok': True, 'account': account,
+        'total_fetched': total_fetched,
+        'fetch_from': fetch_from, 'fetch_to': fetch_to,
+        'new_dates': len(new_rows),
     }
 
 @app.route('/api/sales-upload/<account>', methods=['POST'])
@@ -1499,7 +1975,31 @@ def sales_debug(account):
         'meta': store.get('__meta__', {}),
     })
 
-@app.route('/api/sales-clear/<account>', methods=['POST'])
+@app.route('/api/sales-debug/<account>/dates', methods=['GET'])
+def sales_debug_dates(account):
+    """Debug: show raw rows for specific dates."""
+    account = account.upper().replace('-', ' ')
+    dates = request.args.get('dates', '').split(',')
+    store = _load_sales_store(account)
+    result = {}
+    for d in dates:
+        d = d.strip()
+        rows = store.get(d, [])
+        result[d] = {
+            'count': len(rows),
+            'statuses': {},
+            'sample': rows[:3],
+        }
+        for r in rows:
+            s = r.get('status', 'unknown')
+            result[d]['statuses'][s] = result[d]['statuses'].get(s, 0) + 1
+    # Also show all keys that look numeric (unix timestamp bug)
+    numeric_keys = [k for k in store if not k.startswith('__') and not k.startswith('2')]
+    result['__numeric_keys__'] = numeric_keys[:10]
+    result['__all_date_keys__'] = sorted([k for k in store if not k.startswith('__')])[-10:]
+    return jsonify(result)
+
+
 def sales_clear(account):
     """Delete stored sales data for an account so it can be re-uploaded cleanly."""
     account = account.upper().replace('-', ' ')
@@ -1547,7 +2047,100 @@ def sales_data(account):
         result = _compute_analytics(clean)
         if result and meta.get('updated_at'):
             result['updated_at'] = meta['updated_at']
+        # Add order IDs for cross-referencing with ads campaign order data
+        if result:
+            order_ids = set()
+            for rows in clean.values():
+                for r in rows:
+                    oid = r.get('order_item_id', '')
+                    if oid:
+                        # Campaign Order uses OD prefix, our store uses numeric ID
+                        order_ids.add(oid)
+                        order_ids.add('OD' + oid)
+            result['order_ids'] = list(order_ids)
         return jsonify(result or {'empty': True})
+
+
+@app.route('/api/sales-sync/<account>', methods=['POST'])
+def sales_sync(account):
+    """
+    Trigger a Flipkart API sync for the given account.
+    Runs in a background thread to avoid HTTP timeout on large syncs.
+    """
+    import threading
+    account = account.upper().replace('-', ' ')
+    if account not in SALES_ACCOUNTS:
+        return jsonify({'error': f'Unknown account: {account}'}), 400
+    app_id, _ = _fk_credentials(account)
+    if not app_id:
+        return jsonify({'error': f'No Flipkart API credentials configured for {account}. '
+                                  f'Set {_fk_env_key(account)}_APP_ID and _APP_SECRET in Railway.'}), 400
+    body = request.get_json() or {}
+    full_resync = bool(body.get('full_resync', False))
+
+    # Check if a sync is already running for this account
+    sync_key = f'__syncing_{account}__'
+    store_check = _load_sales_store(account)
+    if store_check.get(sync_key):
+        return jsonify({'ok': True, 'status': 'already_running',
+                        'message': 'Sync already in progress for this account.'})
+
+    def _bg_sync():
+        try:
+            # Mark sync in progress
+            s = _load_sales_store(account)
+            s[sync_key] = True
+            _save_sales_store(account, s)
+            _fk_sync_sales(account, full_resync=full_resync)
+            print(f'[BgSync] {account} completed successfully')
+        except Exception as e:
+            print(f'[BgSync] {account} error: {e}')
+            traceback.print_exc()
+        finally:
+            # Always clear sync flag
+            try:
+                s = _load_sales_store(account)
+                s.pop(sync_key, None)
+                _save_sales_store(account, s)
+                print(f'[BgSync] {account} sync flag cleared')
+            except Exception as fe:
+                print(f'[BgSync] {account} failed to clear flag: {fe}')
+
+    t = threading.Thread(target=_bg_sync, daemon=True)
+    t.start()
+    return jsonify({'ok': True, 'status': 'started',
+                    'message': f'{"Full re-sync" if full_resync else "Sync"} started in background for {account}. Refresh in 30–60 seconds.'})
+
+
+@app.route('/api/sales-sync-clear/<account>', methods=['POST'])
+def sales_sync_clear(account):
+    """Clear a stuck sync flag."""
+    account = account.upper().replace('-', ' ')
+    store = _load_sales_store(account)
+    sync_key = f'__syncing_{account}__'
+    store.pop(sync_key, None)
+    _save_sales_store(account, store)
+    return jsonify({'ok': True, 'message': f'Sync flag cleared for {account}'})
+
+
+@app.route('/api/sales-sync-status', methods=['GET'])
+def sales_sync_status():
+    """Return sync status for all accounts — which have API credentials, last sync time."""
+    results = {}
+    for account in SALES_ACCOUNTS:
+        app_id, _ = _fk_credentials(account)
+        store = _load_sales_store(account)
+        meta  = store.get('__meta__', {})
+        sync_key = f'__syncing_{account}__'
+        results[account] = {
+            'api_configured': bool(app_id),
+            'sync_method':    meta.get('sync_method', 'xlsx'),
+            'updated_at':     meta.get('updated_at', 'never'),
+            'fetch_from':     meta.get('fetch_from', ''),
+            'fetch_to':       meta.get('fetch_to', ''),
+            'syncing':        bool(store.get(sync_key, False)),
+        }
+    return jsonify(results)
 
 
 # ─────────────────────────────────────────────
@@ -1854,49 +2447,17 @@ def _build_ads_response(store):
     """Merge all date buckets in store into a flat data dict for the frontend."""
     meta = store.get('__meta__', {})
 
-    # Merge rows across all date buckets — process in bucket date order so later
-    # buckets (newer uploads) win on overlapping dates.
+    # Merge rows across all date buckets
     merged = {}   # report_key -> [rows]
-    for bucket in sorted(k for k in store if not k.startswith('__')):
-        reports = store[bucket]
+    for bucket, reports in store.items():
+        if bucket.startswith('__'):
+            continue
         if not isinstance(reports, dict):
             continue
         for key, rows in reports.items():
             if key not in merged:
                 merged[key] = []
             merged[key].extend(rows)
-
-    # Deduplicate consolidated (daily) report by Campaign ID + Date.
-    # When two buckets cover overlapping dates (e.g. Mar 1–30 and Mar 29–Apr 15),
-    # the later bucket's row wins (already appended last due to sorted bucket order).
-    if 'consolidated' in merged:
-        seen = {}
-        deduped = []
-        for row in merged['consolidated']:
-            cid  = row.get('Campaign ID', '')
-            date = row.get('Date', '')
-            key  = f'{cid}|{date}'
-            seen[key] = row   # later row overwrites earlier for same key
-        merged['consolidated'] = list(seen.values())
-
-    # Also deduplicate consolidatedFSN by Campaign ID + Sku Id (period aggregate,
-    # but same SKU-campaign combo may appear in multiple bucket uploads)
-    if 'consolidatedFSN' in merged:
-        seen = {}
-        for row in merged['consolidatedFSN']:
-            key = f"{row.get('Campaign ID','')}|{row.get('Sku Id','')}"
-            if key not in seen:
-                seen[key] = {'row': row, 'revenue': 0.0, 'roi_sum': 0.0, 'count': 0}
-            seen[key]['revenue']  += float(row.get('Total Revenue (Rs.)', 0) or 0)
-            seen[key]['roi_sum']  += float(row.get('ROI', 0) or 0)
-            seen[key]['count']    += 1
-        deduped_fsn = []
-        for entry in seen.values():
-            r = dict(entry['row'])
-            r['Total Revenue (Rs.)'] = entry['revenue']
-            r['ROI'] = entry['roi_sum'] / entry['count'] if entry['count'] else 0
-            deduped_fsn.append(r)
-        merged['consolidatedFSN'] = deduped_fsn
 
     # Auto-correct common swap: if 'consolidated' lacks 'Ad Spend' but 'consolidatedFSN'
     # has it, swap them so the frontend KPI block always reads spend from 'consolidated'
@@ -1908,17 +2469,11 @@ def _build_ads_response(store):
     if not _has_spend(consol) and _has_spend(consol_fsn):
         merged['consolidated'], merged['consolidatedFSN'] = consol_fsn, consol
 
-    # Compute true full date range across all buckets
-    bucket_dates = [k for k in store if re.match(r'^\d{4}-\d{2}-\d{2}$', k)]
-    date_from = min(bucket_dates) if bucket_dates else meta.get('date_from', '')
-    date_to   = meta.get('date_to', '') or (max(bucket_dates) if bucket_dates else '')
-
     return {
         'data':       merged,
         'updated_at': meta.get('updated_at', ''),
-        'date_from':  date_from,
-        'date_to':    date_to,
-        'buckets':    sorted(bucket_dates),
+        'date_from':  meta.get('date_from', ''),
+        'date_to':    meta.get('date_to', ''),
     }
 
 # ─────────────────────────────────────────────
@@ -2354,6 +2909,1004 @@ def debug_pdf():
     finally:
         shutil.rmtree(req_tmp, ignore_errors=True)
 
+
+# ─────────────────────────────────────────────
+# LISTINGS API — FETCH / UPDATE PRICE / UPDATE INVENTORY
+# ─────────────────────────────────────────────
+
+@app.route('/api/listings/<account>', methods=['GET'])
+def listings_get(account):
+    """
+    Fetch one page of ACTIVE listings for the given account from Flipkart API.
+    Query params:
+      - page_id: encrypted page cursor from previous response (omit for first page)
+    Step 1: POST /sellers/listings/v3/search  — one page (500 SKUs), returns sku_id + product_id
+    Step 2: POST /sellers/listings/v3/details — batches of 10, returns price + inventory
+    Returns: { listings, next_page_id, has_more, total_this_page }
+    """
+    import requests as _req
+    account = account.upper().replace('-', ' ')
+    if account not in KNOWN_ACCOUNTS:
+        return jsonify({'error': f'Unknown account: {account}'}), 400
+    page_id = request.args.get('page_id', None) or None   # None means first page
+    try:
+        token   = fk_get_token(account)
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type':  'application/json',
+        }
+
+        # ── Step 1: fetch ONE search page (up to 500 sku_ids) ──
+        search_url  = f'{FK_API_BASE}/sellers/listings/v3/search'
+        payload     = {'filters': {'listing_status': 'ACTIVE'}, 'page_id': page_id}
+        r = _req.post(search_url, json=payload, headers=headers, timeout=30)
+        if r.status_code != 200:
+            return jsonify({'error': f'Flipkart API error [{r.status_code}]: {r.text[:300]}'}), 502
+        data = r.json()
+
+        raw_listings = data.get('listings', [])
+        sku_entries  = []
+        if isinstance(raw_listings, list):
+            for item in raw_listings:
+                sid = item.get('sku_id') or item.get('skuId', '')
+                if sid:
+                    sku_entries.append({'sku_id': sid, 'product_id': item.get('product_id') or item.get('productId', '')})
+        elif isinstance(raw_listings, dict):
+            for sid, item in raw_listings.items():
+                sku_entries.append({'sku_id': sid, 'product_id': item.get('product_id') or item.get('productId', '')})
+
+        next_page_id = data.get('next_page_id') or None
+        has_more     = bool(data.get('has_more')) and bool(next_page_id)
+
+        if not sku_entries:
+            return jsonify({'ok': True, 'account': account, 'listings': [],
+                            'next_page_id': None, 'has_more': False, 'total_this_page': 0})
+
+        # ── Step 2: fetch details in batches of 10 ──
+        details_url = f'{FK_API_BASE}/sellers/listings/v3/details'
+        detail_map  = {}
+        sku_ids     = [e['sku_id'] for e in sku_entries]
+        for i in range(0, len(sku_ids), 10):
+            batch = sku_ids[i:i+10]
+            dr = _req.post(details_url, json={'sku_ids': batch}, headers=headers, timeout=30)
+            if dr.status_code == 200:
+                for sku_id, det in dr.json().get('available', {}).items():
+                    price = det.get('price', {})
+                    locs  = det.get('locations', [])
+                    stock = sum(loc.get('inventory', 0) for loc in locs if loc.get('status') == 'ENABLED')
+                    detail_map[sku_id] = {
+                        'selling_price': price.get('selling_price', ''),
+                        'mrp':           price.get('mrp', ''),
+                        'mop':           price.get('mop', ''),
+                        'stock_count':   stock,
+                        'fsn':           det.get('fsn', ''),
+                        'locations':     [{'id': loc.get('id',''), 'status': loc.get('status','ENABLED')} for loc in locs],
+                    }
+
+        # ── Merge ──
+        listings = []
+        for e in sku_entries:
+            sid = e['sku_id']
+            det = detail_map.get(sid, {})
+            listings.append({
+                'sku_id':        sid,
+                'product_id':    e['product_id'],
+                'fsn':           det.get('fsn', ''),
+                'selling_price': det.get('selling_price', ''),
+                'mrp':           det.get('mrp', ''),
+                'mop':           det.get('mop', ''),
+                'stock_count':   det.get('stock_count', 0),
+                'locations':     det.get('locations', []),
+            })
+
+        return jsonify({
+            'ok':             True,
+            'account':        account,
+            'listings':       listings,
+            'next_page_id':   next_page_id,
+            'has_more':       has_more,
+            'total_this_page': len(listings),
+        })
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/listings/<account>/update-price', methods=['POST'])
+def listings_update_price(account):
+    """
+    Update selling price for one or more SKUs.
+    Body: { skus: [{sku_id, product_id, mrp, selling_price}, ...] }
+    Batches into groups of 10 (API limit). Returns per-SKU Flipkart status.
+    """
+    import requests as _req
+    account = account.upper().replace('-', ' ')
+    if account not in KNOWN_ACCOUNTS:
+        return jsonify({'error': f'Unknown account: {account}'}), 400
+    body = request.get_json() or {}
+    skus = body.get('skus', [])
+    if not skus:
+        return jsonify({'error': 'No SKUs provided'}), 400
+    try:
+        token   = fk_get_token(account)
+        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+        url     = f'{FK_API_BASE}/sellers/listings/v3/update/price'
+        results = {}
+        for i in range(0, len(skus), 10):
+            batch   = skus[i:i+10]
+            payload = {}
+            for s in batch:
+                payload[s['sku_id']] = {
+                    'product_id': s['product_id'],
+                    'price': {
+                        'mrp':      int(s['mrp']),
+                        'mop':      int(s['mop']),
+                        'currency': 'INR',
+                    }
+                }
+            r = _req.post(url, json=payload, headers=headers, timeout=30)
+            if r.status_code == 200:
+                results.update(r.json())
+            else:
+                for s in batch:
+                    results[s['sku_id']] = {
+                        'status': 'failure',
+                        'errors': [{'severity': 'ERROR', 'description': f'HTTP {r.status_code}: {r.text[:200]}'}]
+                    }
+        return jsonify({'ok': True, 'results': results})
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/listings/<account>/update-inventory', methods=['POST'])
+def listings_update_inventory(account):
+    """
+    Update stock count for one or more SKUs.
+    Body: { skus: [{sku_id, stock_count}, ...] }
+    Batches into groups of 10. Returns per-SKU Flipkart status.
+    """
+    import requests as _req
+    account = account.upper().replace('-', ' ')
+    if account not in KNOWN_ACCOUNTS:
+        return jsonify({'error': f'Unknown account: {account}'}), 400
+    body = request.get_json() or {}
+    skus = body.get('skus', [])
+    if not skus:
+        return jsonify({'error': 'No SKUs provided'}), 400
+    try:
+        token   = fk_get_token(account)
+        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+        url     = f'{FK_API_BASE}/sellers/listings/v3/update/inventory'
+        results = {}
+        for i in range(0, len(skus), 10):
+            batch   = skus[i:i+10]
+            payload = {}
+            for s in batch:
+                # Use stored location IDs if available, otherwise fall back to a single
+                # default location entry. The API requires locations[].id + status + inventory.
+                loc_list = s.get('locations') or []
+                if loc_list:
+                    locations = [{'id': loc['id'], 'inventory': int(s['stock_count'])} for loc in loc_list]
+                else:
+                    locations = [{'id': 'default', 'inventory': int(s['stock_count'])}]
+                payload[s['sku_id']] = {
+                    'product_id': s.get('product_id', ''),
+                    'locations':  locations,
+                }
+            r = _req.post(url, json=payload, headers=headers, timeout=30)
+            if r.status_code == 200:
+                results.update(r.json())
+            else:
+                for s in batch:
+                    results[s['sku_id']] = {
+                        'status': 'failure',
+                        'errors': [{'severity': 'ERROR', 'description': f'HTTP {r.status_code}: {r.text[:200]}'}]
+                    }
+        return jsonify({'ok': True, 'results': results})
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/listings/<account>/by-skus', methods=['POST'])
+def listings_by_skus(account):
+    """
+    Fetch listing details for a specific list of SKU IDs.
+    Body: { sku_ids: [...] }
+    Calls /listings/v3/details in batches of 10.
+    Used by the product filter to load only the relevant SKUs.
+    """
+    import requests as _req
+    account = account.upper().replace('-', ' ')
+    if account not in KNOWN_ACCOUNTS:
+        return jsonify({'error': f'Unknown account: {account}'}), 400
+    body    = request.get_json() or {}
+    sku_ids = body.get('sku_ids', [])
+    if not sku_ids:
+        return jsonify({'ok': True, 'listings': [], 'total': 0})
+    try:
+        token   = fk_get_token(account)
+        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+        details_url = f'{FK_API_BASE}/sellers/listings/v3/details'
+        detail_map  = {}
+        for i in range(0, len(sku_ids), 10):
+            batch = sku_ids[i:i+10]
+            dr = _req.post(details_url, json={'sku_ids': batch}, headers=headers, timeout=30)
+            if dr.status_code == 200:
+                for sku_id, det in dr.json().get('available', {}).items():
+                    price = det.get('price', {})
+                    locs  = det.get('locations', [])
+                    stock = sum(loc.get('inventory', 0) for loc in locs if loc.get('status') == 'ENABLED')
+                    detail_map[sku_id] = {
+                        'selling_price': price.get('selling_price', ''),
+                        'mrp':           price.get('mrp', ''),
+                        'mop':           price.get('mop', ''),
+                        'stock_count':   stock,
+                        'fsn':           det.get('fsn', ''),
+                        'locations':     [{'id': loc.get('id', '')} for loc in locs],
+                        'product_id':    det.get('product_id', ''),
+                    }
+        listings = []
+        for sku_id in sku_ids:
+            det = detail_map.get(sku_id, {})
+            listings.append({
+                'sku_id':        sku_id,
+                'product_id':    det.get('product_id', ''),
+                'fsn':           det.get('fsn', ''),
+                'selling_price': det.get('selling_price', ''),
+                'mrp':           det.get('mrp', ''),
+                'mop':           det.get('mop', ''),
+                'stock_count':   det.get('stock_count', 0),
+                'locations':     det.get('locations', []),
+            })
+        return jsonify({'ok': True, 'listings': listings, 'total': len(listings)})
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# ─────────────────────────────────────────────
+# AUTO-DISPATCH PIPELINE
+# Runs on cron: 8:30am, 11:30am, 2pm, 5pm IST
+# For Cutest Club only (the only API-configured account).
+#
+# Flow:
+#   1. Fetch all APPROVED shipments
+#   2. Trigger label generation (pack) with default/existing dimensions
+#   3. Download combined labels PDF from API
+#   4. Run through Label Sorter pipeline → save to OUTPUT_DIR
+#   5. Mark all as READY_TO_DISPATCH
+#   6. Telegram notification + update OUTPUTS_META
+# ─────────────────────────────────────────────
+
+FK_AUTO_DISPATCH_ACCOUNT  = 'CUTEST CLUB'
+FK_AUTO_DISPATCH_LOCATION = 'LOC87f71f39207645b9b9427c976d4a7da1'
+
+# Default package dimensions for orders with no pre-existing dimensions
+FK_DEFAULT_DIMS = {'length': 10, 'breadth': 5, 'height': 5, 'weight': 0.2}
+
+# ── Cron schedule config — stored in /data so editable at runtime ────────────
+CRON_CONFIG_PATH = os.path.join(_data_dir, 'cron_config.json')
+CRON_DEFAULT = {
+    'enabled': True,
+    'times':   ['08:30', '11:30', '14:00', '17:00'],  # IST, HH:MM 24h
+}
+CRON_WINDOW_MINUTES = 10   # fire if within ±10 min of a scheduled time
+
+def _load_cron_config():
+    if not os.path.exists(CRON_CONFIG_PATH):
+        return CRON_DEFAULT.copy()
+    try:
+        with open(CRON_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        # Ensure required keys exist
+        cfg.setdefault('enabled', True)
+        cfg.setdefault('times',   CRON_DEFAULT['times'])
+        return cfg
+    except Exception:
+        return CRON_DEFAULT.copy()
+
+def _save_cron_config(cfg):
+    tmp = CRON_CONFIG_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(cfg, f)
+    os.replace(tmp, CRON_CONFIG_PATH)
+
+def _cron_should_fire(cfg):
+    """Return True if current IST time is within CRON_WINDOW_MINUTES of any configured time."""
+    if not cfg.get('enabled'):
+        return False
+    now  = datetime.datetime.now(tz=IST)
+    now_minutes = now.hour * 60 + now.minute
+    for t in cfg.get('times', []):
+        try:
+            h, m = map(int, t.split(':'))
+            sched_minutes = h * 60 + m
+            if abs(now_minutes - sched_minutes) <= CRON_WINDOW_MINUTES:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+@app.route('/api/auto-dispatch/cron-config', methods=['GET'])
+def cron_config_get():
+    """Return current cron schedule config."""
+    return jsonify(_load_cron_config())
+
+@app.route('/api/auto-dispatch/cron-config', methods=['POST'])
+def cron_config_save():
+    """Save cron schedule config. PIN protected."""
+    body = request.get_json() or {}
+    if body.get('pin') != '848424':
+        return jsonify({'error': 'Invalid PIN'}), 403
+    times   = body.get('times', [])
+    enabled = bool(body.get('enabled', True))
+    # Validate: 1–6 times, each HH:MM format
+    if not (1 <= len(times) <= 6):
+        return jsonify({'error': 'Must have between 1 and 6 times.'}), 400
+    for t in times:
+        try:
+            h, m = map(int, t.split(':'))
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError()
+        except Exception:
+            return jsonify({'error': f'Invalid time format: {t}. Use HH:MM (24h).'}), 400
+    cfg = {'enabled': enabled, 'times': times}
+    _save_cron_config(cfg)
+    return jsonify({'ok': True, 'config': cfg})
+
+
+def _fk_auto_dispatch(test_mode=False):
+    """
+    Core auto-dispatch pipeline.
+    If test_mode=True: processes only 1 shipment, skips RTD marking.
+    Used to verify invoice generation before enabling for all orders.
+    """
+    import requests as _req
+
+    account  = FK_AUTO_DISPATCH_ACCOUNT
+    location = FK_AUTO_DISPATCH_LOCATION
+
+    try:
+        token   = fk_get_token(account)
+    except RuntimeError as e:
+        return {'ok': False, 'error': str(e)}
+
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    base    = FK_API_BASE + '/sellers'
+
+    # ── Step 1: Fetch all APPROVED shipments ──────────────────────────────────
+    approved_shipments = []   # list of {shipmentId, subShipments}
+    next_url = f'{base}/v3/shipments/filter/'
+    payload  = {
+        'filter': {
+            'type':       'preDispatch',
+            'states':     ['APPROVED'],
+            'locationId': location,
+            # Only orders whose dispatch window has opened (excludes Upcoming Orders)
+            'dispatchAfterDate': {
+                'from': '2000-01-01T00:00:00+05:30',
+                'to':   datetime.datetime.now(tz=IST).strftime('%Y-%m-%dT%H:%M:%S+05:30'),
+            },
+        },
+        'pagination': {'pageSize': 20},
+    }
+    fetched = 0
+    while next_url and fetched < 2000:
+        try:
+            r = (_req.post(next_url, json=payload, headers=headers, timeout=30)
+                 if next_url.endswith('/filter/')
+                 else _req.get(next_url, headers=headers, timeout=30))
+            if r.status_code != 200:
+                return {'ok': False, 'error': f'Shipment filter failed [{r.status_code}]: {r.text[:200]}'}
+            data = r.json()
+            for s in data.get('shipments', []):
+                approved_shipments.append(s)
+                fetched += 1
+            if not data.get('hasMore') or not data.get('nextPageUrl'):
+                break
+            raw_next = data['nextPageUrl']
+            # Flipkart sometimes returns a relative path — prepend base if needed
+            if raw_next.startswith('/'):
+                next_url = f'{FK_API_BASE}/sellers{raw_next}' if not raw_next.startswith('/sellers') else f'{FK_API_BASE}{raw_next}'
+            elif not raw_next.startswith('http'):
+                next_url = f'{FK_API_BASE}/sellers/{raw_next}'
+            else:
+                next_url = raw_next
+            payload  = None   # subsequent pages use GET to nextPageUrl
+        except Exception as e:
+            return {'ok': False, 'error': f'Shipment filter error: {e}'}
+
+    if not approved_shipments:
+        return {'ok': True, 'message': 'No APPROVED shipments found — nothing to process.',
+                'total': 0, 'packed': 0, 'rtd': 0}
+
+    if test_mode:
+        approved_shipments = approved_shipments[:1]
+        print(f'[AutoDispatch TEST MODE] Limiting to 1 shipment: {approved_shipments[0].get("shipmentId")}')
+
+    print(f'[AutoDispatch] Found {len(approved_shipments)} APPROVED shipments for {account}')
+
+    # ── Step 2: Pack (trigger label generation) in batches of 25 ─────────────
+    pack_url   = f'{base}/v3/shipments/labels'
+    shipment_ids_packed = []
+    pack_errors = []
+
+    # Product → GST rate mapping (IGST %)
+    # All products default to 5% except the ones listed below
+    FK_PRODUCT_TAX_RATES = {
+        'Japanese Massager':          18,
+        'Retinal Shot':               18,
+        'Perfectx':                   18,
+        'Bee Venom Cream':            18,
+    }
+    FK_DEFAULT_TAX_RATE = 5
+
+    # Build SKU → product name map from Master SKU file for tax rate lookup
+    sku_to_product = {}
+    if os.path.exists(MASTER_SKU_PATH):
+        try:
+            with open(MASTER_SKU_PATH, 'rb') as f:
+                _master = load_sku_master(f.read())
+            _acct_master = get_account_master(_master, account)
+            for _sku, _info in _acct_master.items():
+                if _info.get('product'):
+                    sku_to_product[_sku] = _info['product'].strip().title()
+        except Exception as _me:
+            print(f'[AutoDispatch] Master SKU load failed: {_me}')
+
+    for i in range(0, len(approved_shipments), 25):
+        batch = approved_shipments[i:i+25]
+        pack_payload = {'shipments': []}
+        now_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        for s in batch:
+            sid        = s.get('shipmentId') or s.get('shipment_id', '')
+            order_items = s.get('orderItems', [])
+
+            # Build invoices — one entry per unique orderId in this shipment
+            seen_orders = {}
+            for item in order_items:
+                oid = item.get('orderId', '')
+                if oid and oid not in seen_orders:
+                    seen_orders[oid] = True
+            invoices = [{'orderId': oid, 'invoiceDate': now_iso} for oid in seen_orders]
+
+            # Build taxItems — one entry per orderItem with correct GST rate per product
+            tax_items = []
+            for item in order_items:
+                oiid     = item.get('orderItemId', '')
+                qty      = int(item.get('quantity', 1))
+                price    = float((item.get('priceComponents') or {}).get('sellingPrice') or 0)
+                sku_raw  = item.get('sku', '')
+                sku_clean = re.sub(r'^"""SKU:|"""$', '', sku_raw).strip().strip('"')
+                # Resolve product name via master SKU map
+                product  = sku_to_product.get(sku_clean, '')
+                if not product:
+                    stripped = re.sub(r'\s*(Pack\s*\d+\w*|PCK\d*|\d+\s*PCK)\s*$', '', sku_clean, flags=re.IGNORECASE).strip()
+                    product  = sku_to_product.get(stripped, stripped)
+                # Look up tax rate from mapping
+                tax_rate = int(FK_PRODUCT_TAX_RATES.get(product, FK_DEFAULT_TAX_RATE))
+                print(f'[AutoDispatch] SKU "{sku_clean}" → product "{product}" → taxRate {tax_rate}%')
+                if oiid:
+                    tax_items.append({
+                        'orderItemId': oiid,
+                        'taxRate':     int(tax_rate),
+                        'quantity':    qty,
+                        # purchasePrice intentionally omitted — only for refurbished products
+                    })
+
+            # Build sub-shipment entries with default dimensions
+            # Skip any SS-* IDs (Flipkart placeholder values that the pack API rejects)
+            sub_shipments = []
+            for sub in s.get('subShipments', []):
+                sub_id = sub.get('subShipmentId', '')
+                # Skip placeholder SS-* IDs
+                if sub_id and not sub_id.startswith('SS-'):
+                    sub_shipments.append({
+                        'subShipmentId': sub_id,
+                        'dimensions':    FK_DEFAULT_DIMS,
+                    })
+            # If no valid sub-shipment IDs, use the shipmentId itself
+            if not sub_shipments:
+                sub_shipments = [{'subShipmentId': sid, 'dimensions': FK_DEFAULT_DIMS}]
+
+            pack_payload['shipments'].append({
+                'shipmentId':   sid,
+                'locationId':   location,
+                'invoices':     invoices,
+                'taxItems':     tax_items,
+                'subShipments': sub_shipments,
+            })
+        try:
+            print(f'[AutoDispatch] Pack payload batch {i//25+1}: {json.dumps(pack_payload)[:500]}')
+            r = _req.post(pack_url, json=pack_payload, headers=headers, timeout=60)
+            if r.status_code == 200:
+                resp_json = r.json()
+                print(f'[AutoDispatch] Pack batch {i//25+1} response: {json.dumps(resp_json)[:300]}')
+                for result in resp_json.get('shipments', []):
+                    status = result.get('status', '').upper()
+                    if status in ('SUCCESS', 'PACKED', ''):
+                        shipment_ids_packed.append(result['shipmentId'])
+                    else:
+                        pack_errors.append(f"{result['shipmentId']}: {result.get('errorMessage','')}")
+                # If API returned empty shipments list, all succeeded — add original IDs
+                if not resp_json.get('shipments'):
+                    for s in batch:
+                        sid = s.get('shipmentId') or s.get('shipment_id', '')
+                        if sid:
+                            shipment_ids_packed.append(sid)
+            else:
+                pack_errors.append(f'Batch {i//25+1} HTTP {r.status_code}: {r.text[:150]}')
+        except Exception as e:
+            pack_errors.append(f'Batch {i//25+1} error: {e}')
+
+    print(f'[AutoDispatch] Packed {len(shipment_ids_packed)} shipments. Errors: {len(pack_errors)}')
+    if pack_errors:
+        for e in pack_errors[:5]:
+            print(f'  [PackError] {e}')
+
+    if not shipment_ids_packed:
+        error_detail = '; '.join(pack_errors[:3]) if pack_errors else 'No detail available'
+        return {'ok': False, 'error': f'All shipments failed to pack. Details: {error_detail}',
+                'pack_errors': pack_errors}
+
+    # ── Step 3a: Re-fetch PACKED shipment IDs to get the exact IDs the download endpoint expects ──
+    # The pack API sometimes returns empty/different IDs. Re-querying for PACKED state
+    # gives us the canonical IDs that the label download endpoint will accept.
+    import time as _time
+    _time.sleep(15)
+
+    packed_ids_verified = []
+    try:
+        next_url2 = f'{base}/v3/shipments/filter/'
+        payload2  = {
+            'filter': {
+                'type':       'preDispatch',
+                'states':     ['PACKED', 'READY_TO_DISPATCH'],
+                'locationId': location,
+            },
+            'pagination': {'pageSize': 20},
+        }
+        fetched2 = 0
+        while next_url2 and fetched2 < 2000:
+            r2 = (_req.post(next_url2, json=payload2, headers=headers, timeout=30)
+                  if next_url2.endswith('/filter/')
+                  else _req.get(next_url2, headers=headers, timeout=30))
+            if r2.status_code == 200:
+                data2 = r2.json()
+                for s in data2.get('shipments', []):
+                    sid = s.get('shipmentId', '')
+                    if sid:
+                        packed_ids_verified.append(sid)
+                        fetched2 += 1
+                if not data2.get('hasMore') or not data2.get('nextPageUrl'):
+                    break
+                raw_next2 = data2['nextPageUrl']
+                if raw_next2.startswith('/'):
+                    next_url2 = f'{FK_API_BASE}/sellers{raw_next2}' if not raw_next2.startswith('/sellers') else f'{FK_API_BASE}{raw_next2}'
+                elif not raw_next2.startswith('http'):
+                    next_url2 = f'{FK_API_BASE}/sellers/{raw_next2}'
+                else:
+                    next_url2 = raw_next2
+                payload2 = None
+            else:
+                break
+    except Exception as e:
+        print(f'[AutoDispatch] Re-fetch PACKED error: {e}')
+
+    # Use re-fetched IDs if we got them, else fall back to pack response IDs
+    download_ids = packed_ids_verified if packed_ids_verified else shipment_ids_packed
+    print(f'[AutoDispatch] Using {len(download_ids)} IDs for label download (re-fetched: {len(packed_ids_verified)})')
+
+    # Download in batches of 25 IDs
+    label_pdf_parts = []
+    label_dl_errors = []
+    for i in range(0, len(download_ids), 25):
+        batch_ids = ','.join(download_ids[i:i+25])
+        # Try the combined labels+invoice endpoint first, fall back to labelOnly
+        for endpoint_path in [
+            f'{base}/v3/shipments/{batch_ids}/labels',
+            f'{base}/v3/shipments/{batch_ids}/labelOnly/pdf',
+        ]:
+            try:
+                r = _req.get(
+                    endpoint_path,
+                    headers={**headers, 'Accept': 'application/pdf'},
+                    timeout=60,
+                )
+                if r.status_code == 200 and r.content and r.content[:4] == b'%PDF':
+                    label_pdf_parts.append(r.content)
+                    print(f'[AutoDispatch] Label batch {i//25+1} downloaded ({len(r.content)} bytes) via {endpoint_path}')
+                    break
+                else:
+                    label_dl_errors.append(
+                        f'Batch {i//25+1} [{r.status_code}] {endpoint_path}: {r.text[:200]}'
+                    )
+                    print(f'[AutoDispatch] Label batch {i//25+1} failed [{r.status_code}]: {r.text[:200]}')
+            except Exception as e:
+                label_dl_errors.append(f'Batch {i//10+1} error: {e}')
+                print(f'[AutoDispatch] Label download error: {e}')
+
+    if not label_pdf_parts:
+        error_detail = '; '.join(label_dl_errors[:3]) if label_dl_errors else 'No response from API'
+        return {
+            'ok': False,
+            'error': f'Failed to download labels PDF. Details: {error_detail}',
+            'label_errors': label_dl_errors,
+            'pack_errors':  pack_errors,
+        }
+
+    # Merge all label PDF bytes into one (simple concatenation via PdfWriter)
+    combined_writer = PdfWriter()
+    for pdf_bytes in label_pdf_parts:
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            for page in reader.pages:
+                combined_writer.add_page(page)
+            del reader
+        except Exception as e:
+            print(f'[AutoDispatch] PDF merge error: {e}')
+
+    # ── Step 4: Run Label Sorter pipeline ─────────────────────────────────────
+    req_tmp = tempfile.mkdtemp(prefix='fk_auto_')
+    try:
+        # Save combined PDF to temp file
+        tmp_pdf_path = os.path.join(req_tmp, 'auto_labels.pdf')
+        with open(tmp_pdf_path, 'wb') as f:
+            combined_writer.write(f)
+        del combined_writer
+        gc.collect()
+
+        if not os.path.exists(MASTER_SKU_PATH):
+            return {'ok': False, 'error': 'Master SKU file not found — cannot sort labels.'}
+
+        with open(MASTER_SKU_PATH, 'rb') as f:
+            master = load_sku_master(f.read())
+
+        # Extract pages
+        account_pages = defaultdict(list)
+        seen_keys     = set()
+        reader = PdfReader(tmp_pdf_path)
+        for i, page in enumerate(reader.pages):
+            text       = page.extract_text() or ''
+            acct       = detect_account(text)
+            skus       = extract_skus_from_page(text)
+            order_ids  = extract_order_ids(text)
+            page_awb   = extract_awb(text)
+            page_key   = (tuple(sorted(order_ids)), page_awb)
+            if page_key in seen_keys:
+                del text; continue
+            seen_keys.add(page_key)
+            account_pages[acct].append({
+                'orig_path': tmp_pdf_path,
+                'orig_idx':  i,
+                'skus':      skus,
+                'text':      text,
+                'order_ids': order_ids,
+            })
+            del text
+        del reader
+        gc.collect()
+
+        sort_results = []
+        for acct, pages in account_pages.items():
+            acct_master = get_account_master(master, acct)
+            normal, dual, mixed, unknown = classify_pages(pages, acct_master)
+            sorted_normal = sort_normal(normal)
+            sorted_dual   = sort_normal(dual)
+            ordered       = sorted_normal + sorted_dual + unknown + mixed
+
+            safe_name    = re.sub(r'[^A-Za-z0-9_]', '_', acct)
+            labels_path  = os.path.join(req_tmp, f'{safe_name}_labels.pdf')
+            summary_path = os.path.join(req_tmp, f'{safe_name}_summary.pdf')
+
+            # Write sorted labels PDF
+            pages_by_pdf = defaultdict(list)
+            for pos, pd_item in enumerate(ordered):
+                pages_by_pdf[pd_item['orig_path']].append((pos, pd_item['orig_idx']))
+            page_slots = [None] * len(ordered)
+            readers_open = {}
+            for pdf_src, idx_pairs in pages_by_pdf.items():
+                r2 = PdfReader(pdf_src)
+                readers_open[pdf_src] = r2
+                for pos, page_idx in idx_pairs:
+                    page_slots[pos] = r2.pages[page_idx]
+            writer = PdfWriter()
+            for page in page_slots:
+                writer.add_page(page)
+            with open(labels_path, 'wb') as f:
+                writer.write(f)
+            del writer, page_slots
+            for r2 in readers_open.values():
+                del r2
+            gc.collect()
+
+            # Build summary
+            build_summary_pdf(acct, normal, dual, mixed, unknown, acct_master, summary_path)
+
+            # Persist to Railway Volume
+            persist_labels  = os.path.join(OUTPUT_DIR, f'{safe_name}_labels.pdf')
+            persist_summary = os.path.join(OUTPUT_DIR, f'{safe_name}_summary.pdf')
+            _atomic_copy(labels_path,  persist_labels)
+            _atomic_copy(summary_path, persist_summary)
+
+            # Update OUTPUTS_META
+            meta = {}
+            if os.path.exists(OUTPUTS_META):
+                with open(OUTPUTS_META, 'r') as mf:
+                    try: meta = json.load(mf)
+                    except: pass
+            meta[acct] = {
+                'timestamp':    datetime.datetime.now(tz=IST).strftime('%d %b %Y, %H:%M IST'),
+                'total':        len(pages),
+                'sku_count':    len(normal),
+                'labels_file':  f'{safe_name}_labels.pdf',
+                'summary_file': f'{safe_name}_summary.pdf',
+            }
+            with open(OUTPUTS_META, 'w') as mf:
+                json.dump(meta, mf)
+
+            # Telegram
+            try:
+                tg_notify_sort_done(
+                    account=acct, total=len(pages),
+                    normal_count=len(normal), mixed_count=len(mixed),
+                    unknown_count=len(unknown),
+                    labels_path=persist_labels, summary_path=persist_summary,
+                )
+            except Exception as tg_err:
+                print(f'[AutoDispatch Telegram] {tg_err}')
+
+            sort_results.append({
+                'account':     acct,
+                'total':       len(pages),
+                'sku_count':   len(normal),
+                'mixed':       len(mixed),
+                'unknown':     len(unknown),
+            })
+            del normal, dual, mixed, unknown, ordered, pages
+            gc.collect()
+
+    finally:
+        shutil.rmtree(req_tmp, ignore_errors=True)
+
+    # ── Step 5: Mark RTD in batches of 25 ────────────────────────────────────
+    if test_mode:
+        print(f'[AutoDispatch TEST MODE] Skipping RTD — verify the invoice PDF before proceeding.')
+        timestamp = datetime.datetime.now(tz=IST).strftime('%d %b %Y, %H:%M IST')
+        return {
+            'ok':           True,
+            'test_mode':    True,
+            'timestamp':    timestamp,
+            'total':        1,
+            'packed':       len(shipment_ids_packed),
+            'rtd':          0,
+            'rtd_skipped':  True,
+            'message':      'TEST MODE: 1 order packed and label generated. RTD was NOT marked — check the invoice in Label Sorter downloads, then run full dispatch if correct.',
+            'sort_results': sort_results,
+            'pack_errors':  pack_errors[:10],
+        }
+
+    dispatch_url = f'{base}/v3/shipments/dispatch'
+    rtd_count    = 0
+    rtd_errors   = []
+    for i in range(0, len(shipment_ids_packed), 25):
+        batch = shipment_ids_packed[i:i+25]
+        try:
+            r = _req.post(dispatch_url,
+                          json={'shipmentIds': batch, 'locationId': location},
+                          headers=headers, timeout=30)
+            if r.status_code == 200:
+                for result in r.json().get('shipments', []):
+                    if result.get('status', '').upper() in ('SUCCESS', 'READY_TO_DISPATCH', ''):
+                        rtd_count += 1
+                    else:
+                        rtd_errors.append(f"{result['shipmentId']}: {result.get('errorMessage','')}")
+            else:
+                rtd_errors.append(f'RTD batch {i//25+1} HTTP {r.status_code}: {r.text[:150]}')
+        except Exception as e:
+            rtd_errors.append(f'RTD batch {i//25+1} error: {e}')
+
+    # If API returns empty shipments list, count all as RTD (some API versions do this on full success)
+    if rtd_count == 0 and not rtd_errors:
+        rtd_count = len(shipment_ids_packed)
+
+    print(f'[AutoDispatch] RTD: {rtd_count} marked, {len(rtd_errors)} errors')
+
+    timestamp = datetime.datetime.now(tz=IST).strftime('%d %b %Y, %H:%M IST')
+    return {
+        'ok':           True,
+        'timestamp':    timestamp,
+        'total':        len(approved_shipments),
+        'packed':       len(shipment_ids_packed),
+        'rtd':          rtd_count,
+        'sort_results': sort_results,
+        'pack_errors':  pack_errors[:10],
+        'rtd_errors':   rtd_errors[:10],
+    }
+
+
+
+@app.route('/api/auto-dispatch/preview', methods=['POST'])
+def auto_dispatch_preview():
+    """
+    Returns count of APPROVED shipments without doing anything.
+    Used by the frontend confirmation step.
+    """
+    import requests as _req
+    data = request.get_json() or {}
+    if data.get('pin') != '848424':
+        return jsonify({'error': 'Invalid PIN'}), 403
+
+    account  = FK_AUTO_DISPATCH_ACCOUNT
+    location = FK_AUTO_DISPATCH_LOCATION
+    try:
+        token = fk_get_token(account)
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
+
+    headers  = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    base     = FK_API_BASE + '/sellers'
+    count    = 0
+    next_url = f'{base}/v3/shipments/filter/'
+    payload  = {
+        'filter': {
+            'type':       'preDispatch',
+            'states':     ['APPROVED'],
+            'locationId': location,
+            # Only orders whose dispatch window has opened (excludes Upcoming Orders)
+            'dispatchAfterDate': {
+                'from': '2000-01-01T00:00:00+05:30',
+                'to':   datetime.datetime.now(tz=IST).strftime('%Y-%m-%dT%H:%M:%S+05:30'),
+            },
+        },
+        'pagination': {'pageSize': 20},
+    }
+    try:
+        while next_url and count < 2000:
+            r = (_req.post(next_url, json=payload, headers=headers, timeout=30)
+                 if next_url.endswith('/filter/')
+                 else _req.get(next_url, headers=headers, timeout=30))
+            if r.status_code != 200:
+                return jsonify({'error': f'API error [{r.status_code}]: {r.text[:200]}'}), 502
+            resp_data = r.json()
+            count += len(resp_data.get('shipments', []))
+            if not resp_data.get('hasMore') or not resp_data.get('nextPageUrl'):
+                break
+            raw_next = resp_data['nextPageUrl']
+            if raw_next.startswith('/'):
+                next_url = f'{FK_API_BASE}/sellers{raw_next}' if not raw_next.startswith('/sellers') else f'{FK_API_BASE}{raw_next}'
+            elif not raw_next.startswith('http'):
+                next_url = f'{FK_API_BASE}/sellers/{raw_next}'
+            else:
+                next_url = raw_next
+            payload = None
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    return jsonify({'ok': True, 'count': count})
+
+@app.route('/api/auto-dispatch', methods=['POST'])
+def auto_dispatch_trigger():
+    """
+    Manual trigger for the auto-dispatch pipeline.
+    Pass test_mode: true to process only 1 order without marking RTD.
+    """
+    data = request.get_json() or {}
+    if data.get('pin') != '848424':
+        return jsonify({'error': 'Invalid PIN'}), 403
+    test_mode = bool(data.get('test_mode', False))
+    result = _fk_auto_dispatch(test_mode=test_mode)
+    return jsonify(result)
+
+
+@app.route('/api/auto-dispatch/cron', methods=['GET', 'POST'])
+def auto_dispatch_cron():
+    """
+    Called by Railway cron every 30 minutes — no PIN required.
+    Checks the stored schedule config before firing.
+    """
+    now_str = datetime.datetime.now(tz=IST).strftime('%d %b %Y, %H:%M IST')
+    cfg = _load_cron_config()
+    if not cfg.get('enabled'):
+        print(f'[AutoDispatch Cron] {now_str} — skipped (cron disabled)')
+        return jsonify({'ok': True, 'skipped': True, 'reason': 'cron disabled'})
+    if not _cron_should_fire(cfg):
+        print(f'[AutoDispatch Cron] {now_str} — skipped (not a scheduled time; schedule: {cfg["times"]})')
+        return jsonify({'ok': True, 'skipped': True, 'reason': 'not a scheduled time'})
+    print(f'[AutoDispatch Cron] {now_str} — FIRING (matched schedule: {cfg["times"]})')
+    result = _fk_auto_dispatch()
+    print(f'[AutoDispatch Cron] Result: {json.dumps(result)}')
+    return jsonify(result)
+
+
+@app.route('/api/reports/probe', methods=['POST'])
+def reports_probe():
+    """
+    Diagnostic: tries a list of candidate reportTypeIdentifiers against
+    the Flipkart Reports API and returns what each one responds with.
+    PIN-protected.
+    """
+    import requests as _req, uuid as _uuid
+
+    data = request.get_json() or {}
+    if data.get('pin') != '848424':
+        return jsonify({'error': 'Invalid PIN'}), 403
+
+    try:
+        token = fk_get_token('CUTEST CLUB')
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
+
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    base    = FK_API_BASE + '/sellers'
+
+    # Candidate report type identifiers to probe — common names used in
+    # Flipkart seller portal and seen in various SDK references
+    candidates = [
+        'consolidated_daily_report',
+        'consolidated_daily',
+        'ads_consolidated_daily',
+        'ads_consolidated',
+        'ads_fsn_report',
+        'fsn_report',
+        'campaign_order_report',
+        'campaign_order',
+        'ads_campaign_order',
+        'search_term_report',
+        'ads_search_term',
+        'keyword_report',
+        'ads_keyword',
+        'product_listing_ads',
+        'pla_report',
+        'pca_report',
+        'order_report',
+        'sale_report',
+        'sales_report',
+        'settlement_report',
+        'return_report',
+        'returns_report',
+        'inventory_report',
+        'tax_report',
+    ]
+
+    results = {}
+    today = datetime.datetime.now(tz=IST)
+    from_date = (today - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+
+    for rtype in candidates:
+        try:
+            payload = {
+                'correlation_id': str(_uuid.uuid4()),
+                'parameters': {
+                    'from_date': from_date,
+                },
+            }
+            r = _req.post(
+                f'{base}/reports/{rtype}',
+                json=payload,
+                headers=headers,
+                timeout=15,
+            )
+            results[rtype] = {
+                'status_code': r.status_code,
+                'response':    r.text[:300],
+            }
+        except Exception as e:
+            results[rtype] = {'status_code': None, 'response': str(e)}
+
+    return jsonify({'ok': True, 'results': results})
+
 @app.route('/api/debug')
 def debug():
     import datetime
@@ -2371,6 +3924,51 @@ def debug():
         with open(OUTPUTS_META, 'r') as f:
             info['meta_contents'] = json.load(f)
     return jsonify(info)
+
+
+def fk_token_status():
+    """
+    Check Flipkart API token status for all configured accounts.
+    Safe to expose — returns no secrets, just connectivity status.
+    """
+    results = {}
+    for account in KNOWN_ACCOUNTS:
+        app_id, app_secret = _fk_credentials(account)
+        if not app_id:
+            results[account] = {'configured': False}
+            continue
+        cache = _fk_load_token_cache()
+        entry = cache.get(account, {})
+        now   = datetime.datetime.now(tz=datetime.timezone.utc).timestamp()
+        expires_at = entry.get('expires_at', 0)
+        hours_left = max(0, int((expires_at - now) / 3600)) if expires_at else 0
+        results[account] = {
+            'configured':  True,
+            'has_token':   bool(entry.get('access_token')),
+            'fetched_at':  entry.get('fetched_at', 'never'),
+            'hours_left':  hours_left,
+        }
+    return jsonify(results)
+
+
+@app.route('/api/fk-token-refresh', methods=['POST'])
+def fk_token_refresh():
+    """Force-refresh the Flipkart token for a given account. PIN protected."""
+    data    = request.get_json() or {}
+    if data.get('pin') != '848424':
+        return jsonify({'error': 'Invalid PIN'}), 403
+    account = data.get('account', '').upper()
+    if account not in KNOWN_ACCOUNTS:
+        return jsonify({'error': f'Unknown account: {account}'}), 400
+    # Clear cached token to force refresh
+    cache = _fk_load_token_cache()
+    cache.pop(account, None)
+    _fk_save_token_cache(cache)
+    try:
+        token = fk_get_token(account)
+        return jsonify({'ok': True, 'account': account, 'token_preview': token[:8] + '…'})
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/latest-outputs')
@@ -2512,212 +4110,1014 @@ def _register_telegram_webhook():
     except Exception as e:
         print(f'[Telegram] Failed to set webhook: {e}')
 
+# ─────────────────────────────────────────────
+# LISTING GENERATOR
+# ─────────────────────────────────────────────
+
+LISTING_TEMPLATE_PATH  = os.path.join(_data_dir, 'listing_template.xlsx')
+LISTING_PROFILES_PATH  = os.path.join(_data_dir, 'listing_profiles.json')
+
+@app.route('/api/listing-gen/upload-template', methods=['POST'])
+def listing_gen_upload_template():
+    """Store the blank XLSX template server-side for the listing generator."""
+    f = request.files.get('template')
+    if not f:
+        return jsonify({'error': 'No file uploaded'}), 400
+    data = f.read()
+    # Validate it's a real xlsx
+    try:
+        import openpyxl, io as _io
+        openpyxl.load_workbook(_io.BytesIO(data))
+    except Exception as e:
+        return jsonify({'error': f'Invalid XLSX: {e}'}), 400
+    tmp = LISTING_TEMPLATE_PATH + '.tmp'
+    with open(tmp, 'wb') as out:
+        out.write(data)
+    os.replace(tmp, LISTING_TEMPLATE_PATH)
+    # Return sheet names so frontend can confirm category sheet
+    wb = openpyxl.load_workbook(LISTING_TEMPLATE_PATH)
+    return jsonify({'ok': True, 'sheets': wb.sheetnames, 'filename': f.filename})
+
+@app.route('/api/listing-gen/template-status', methods=['GET'])
+def listing_gen_template_status():
+    """Check if a template is stored."""
+    if not os.path.exists(LISTING_TEMPLATE_PATH):
+        return jsonify({'exists': False})
+    wb = openpyxl.load_workbook(LISTING_TEMPLATE_PATH)
+    return jsonify({'exists': True, 'sheets': wb.sheetnames})
+
+@app.route('/api/listing-gen/upload-images', methods=['POST'])
+def listing_gen_upload_images():
+    """Upload images to ImgBB anonymously and return public URLs."""
+    import requests as _req, base64 as _b64
+    IMGBB_API = 'https://api.imgbb.com/1/upload'
+    IMGBB_KEY = os.environ.get('IMGBB_API_KEY', '')  # optional key, anonymous works too
+
+    files = request.files.getlist('images')
+    if not files:
+        return jsonify({'error': 'No images uploaded'}), 400
+
+    urls = []
+    errors = []
+    for f in files:
+        try:
+            img_data = f.read()
+            b64 = _b64.b64encode(img_data).decode()
+            params = {'key': IMGBB_KEY} if IMGBB_KEY else {}
+            # ImgBB anonymous upload (no key needed for basic use)
+            resp = _req.post(
+                IMGBB_API,
+                data={'image': b64},
+                params=params,
+                timeout=30
+            )
+            if resp.status_code == 200:
+                j = resp.json()
+                urls.append({'name': f.filename, 'url': j['data']['url'], 'display_url': j['data']['display_url']})
+            else:
+                errors.append({'name': f.filename, 'error': f'ImgBB {resp.status_code}: {resp.text[:100]}'})
+        except Exception as e:
+            errors.append({'name': f.filename, 'error': str(e)})
+
+    return jsonify({'urls': urls, 'errors': errors})
+
+
+@app.route('/api/listing-gen/template-meta', methods=['GET'])
+def listing_gen_template_meta():
+    """Return parsed template metadata: blue/purple col names and Index dropdowns."""
+    import openpyxl, io as _io
+    template_file = request.files.get('template') if request.method == 'POST' else None
+    # Load from stored template
+    if not os.path.exists(LISTING_TEMPLATE_PATH):
+        return jsonify({'error': 'No template stored'}), 404
+    wb = openpyxl.load_workbook(LISTING_TEMPLATE_PATH)
+
+    SKIP_SHEETS = {'Summary Sheet', 'DropDownValuesForColumn27', 'DropDownValuesForColumn33',
+                   'Listing FAQ Sheet', 'Image GuideLines', 'MatchingAttributes',
+                   'VariantAttributes', 'Parent Variant Products', 'template_version'}
+    category_sheet = None
+    for name in wb.sheetnames:
+        if name not in SKIP_SHEETS and name != 'Index':
+            category_sheet = name
+            break
+    if not category_sheet:
+        return jsonify({'error': 'Could not identify category sheet'}), 400
+
+    ws   = wb[category_sheet]
+    BLUE   = 'FF8DB4E2'
+    PURPLE = 'FFCC99FF'
+    GREY   = 'FFC0C0C0'
+
+    # Fields handled automatically (not shown in form)
+    AUTO_FIELDS = {
+        'Flipkart Serial Number', 'Catalog QC Status', 'QC Failed Reason (if any)',
+        'Flipkart Product Link', 'Product Data Status', 'Disapproval Reason (if any)',
+        'Seller SKU ID', 'Listing Status', 'MRP (INR)', 'Your selling price (INR)',
+        'Fullfilment by', 'Procurement type', 'Procurement SLA (DAY)', 'Stock',
+        'Shipping provider', 'Local handling fee (INR)', 'Zonal handling fee (INR)',
+        'National handling fee (INR)', 'Length (CM)', 'Breadth (CM)', 'Height (CM)',
+        'Weight (KG)', 'HSN', 'Country Of Origin', 'Manufacturer Details',
+        'Packer Details', 'Importer Details', 'Tax Code', 'Brand',
+        'Model Name', 'Quantity', 'Quantity - Measuring Unit', 'Pack of',
+        'Main Image URL', 'Other Image URL 1', 'Other Image URL 2',
+        'Other Image URL 3', 'Other Image URL 4', 'Description', 'Key Features',
+        'Search Keywords', 'Items Included',
+    }
+
+    # Parse Index sheet for dropdown values
+    index_values = {}
+    if 'Index' in wb.sheetnames:
+        ws_idx = wb['Index']
+        for col in range(4, ws_idx.max_column + 1):
+            field = ws_idx.cell(row=2, column=col).value
+            if not field: continue
+            if field not in index_values:
+                index_values[field] = []
+            for row in range(3, ws_idx.max_row + 1):
+                v = ws_idx.cell(row=row, column=col).value
+                if v and str(v).strip() and str(v).strip() not in index_values[field]:
+                    index_values[field].append(str(v).strip())
+
+    # Collect dynamic fields (blue/purple NOT in AUTO_FIELDS)
+    dynamic_fields = []
+    for col in range(1, ws.max_column + 1):
+        cell  = ws.cell(row=1, column=col)
+        hdr   = cell.value
+        if not hdr or hdr in AUTO_FIELDS: continue
+        fill  = cell.fill
+        color = fill.fgColor.rgb if fill and fill.fgColor and fill.fgColor.type == 'rgb' else None
+        if color not in (BLUE, PURPLE): continue
+        dynamic_fields.append({
+            'name':     hdr,
+            'required': color == BLUE,
+            'options':  index_values.get(hdr, []),
+        })
+
+    return jsonify({
+        'ok':             True,
+        'category_sheet': category_sheet,
+        'dynamic_fields': dynamic_fields,
+        'index_values':   index_values,
+    })
+
+
+@app.route('/api/listing-gen/profiles', methods=['GET'])
+def listing_gen_get_profiles():
+    """Get all saved listing profiles."""
+    if not os.path.exists(LISTING_PROFILES_PATH):
+        return jsonify({'profiles': {}})
+    try:
+        import json as _json
+        with open(LISTING_PROFILES_PATH, 'r') as f:
+            return jsonify({'profiles': _json.load(f)})
+    except Exception as e:
+        return jsonify({'profiles': {}, 'error': str(e)})
+
+
+@app.route('/api/listing-gen/profiles', methods=['POST'])
+def listing_gen_save_profile():
+    """Save/update a listing profile for a product."""
+    import json as _json
+    data = request.get_json()
+    if not data or not data.get('product_name'):
+        return jsonify({'error': 'product_name required'}), 400
+    profiles = {}
+    if os.path.exists(LISTING_PROFILES_PATH):
+        try:
+            with open(LISTING_PROFILES_PATH, 'r') as f:
+                profiles = _json.load(f)
+        except Exception:
+            profiles = {}
+    profiles[data['product_name']] = data['profile']
+    tmp = LISTING_PROFILES_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        _json.dump(profiles, f, indent=2)
+    os.replace(tmp, LISTING_PROFILES_PATH)
+    return jsonify({'ok': True})
+
+@app.route('/api/listing-gen/generate', methods=['POST'])
+def listing_gen_generate():
+    """
+    Generate a filled XLSX listing file.
+    Expects multipart/form-data with:
+      - form_data: JSON string with all listing parameters
+      - template: optional XLSX file (else uses stored template)
+    """
+    import requests as _req, random, string, io as _io, json as _json
+    import openpyxl
+    from openpyxl import load_workbook
+
+    # ── Parse inputs ──────────────────────────────────────────
+    form_data_raw = request.form.get('form_data')
+    if not form_data_raw:
+        return jsonify({'error': 'Missing form_data'}), 400
+    try:
+        fd = _json.loads(form_data_raw)
+    except Exception:
+        return jsonify({'error': 'Invalid form_data JSON'}), 400
+
+    # Load template
+    template_file = request.files.get('template')
+    if template_file:
+        template_bytes = template_file.read()
+        original_filename = template_file.filename
+    elif os.path.exists(LISTING_TEMPLATE_PATH):
+        with open(LISTING_TEMPLATE_PATH, 'rb') as f:
+            template_bytes = f.read()
+        original_filename = 'listing_output.xlsx'
+    else:
+        return jsonify({'error': 'No template file found. Please upload a template first.'}), 400
+
+    # ── Extract form fields ──────────────────────────────────
+    num_skus        = int(fd['num_skus'])
+    quantities      = fd['quantities']          # {1:n, 2:n, 3:n, 4:n, 5:n}
+    sku_identifier  = fd['sku_identifier'].strip()
+    top_keywords    = [k.strip() for k in fd['top_keywords'].split(',') if k.strip()]
+    description_raw = fd['description_content'].strip()
+    mrp_min         = float(fd['mrp_min']);    mrp_max    = float(fd['mrp_max'])
+    price_min       = float(fd['price_min']);  price_max  = float(fd['price_max'])
+    len_min         = float(fd['len_min']);    len_max    = float(fd['len_max'])
+    bre_min         = float(fd['bre_min']);    bre_max    = float(fd['bre_max'])
+    hei_min         = float(fd['hei_min']);    hei_max    = float(fd['hei_max'])
+    wgt_min         = float(fd['wgt_min']);    wgt_max    = min(float(fd['wgt_max']), 0.49)
+    hsn             = fd['hsn']
+    country         = fd['country_of_origin']
+    manufacturer    = fd['manufacturer_details']
+    packer          = fd['packer_details']
+    importer        = fd['importer_details']
+    tax_code        = fd['tax_code']
+    brand           = fd['brand']
+    main_img_urls_by_pack = fd.get('main_image_urls_by_pack', {})  # {pack_size_str: [urls]}
+    gallery_img_urls      = fd.get('gallery_image_urls', [])
+    mfg_date        = fd.get('mfg_date', '')
+    shelf_life      = fd.get('shelf_life', '24')
+    ideal_for       = fd.get('ideal_for', 'Men & Women')
+    ingredient_type = fd.get('ingredient_type', '')
+    product_type    = fd.get('product_type', '')
+    min_age         = fd.get('min_age', '')
+    max_age         = fd.get('max_age', '')
+
+    # ── Build SKU list with pack sizes ──────────────────────
+    sku_rows = []
+    for pack_size_str, count_str in quantities.items():
+        pack_size = int(pack_size_str)
+        count     = int(count_str) if count_str else 0
+        for _ in range(count):
+            sku_rows.append(pack_size)
+
+    random.shuffle(sku_rows)  # randomise order
+
+    # ── Generate unique SKU IDs ──────────────────────────────
+    sku_ids = []
+    used_prefixes = set()
+    product_name  = fd.get('product_name', sku_identifier)  # change 1/6
+    for pack in sku_rows:
+        while True:
+            prefix = ''.join(random.choices(string.ascii_uppercase, k=3))  # change 9: exactly 3 caps
+            if prefix not in used_prefixes:
+                used_prefixes.add(prefix)
+                break
+        sku_ids.append(f'{prefix} {sku_identifier} {pack} Pack')
+
+    # ── Distribute images evenly ─────────────────────────────
+    def distribute(pool, n):
+        """Distribute pool items across n slots — each item used ~equally."""
+        if not pool: return [''] * n
+        result = []
+        for i in range(n):
+            result.append(pool[i % len(pool)])
+        return result
+
+    # Build per-pack main URL distribution
+    main_urls_by_pack = {}
+    for pack_str, urls in main_img_urls_by_pack.items():
+        main_urls_by_pack[int(pack_str)] = urls
+
+    gallery_slots     = num_skus * 4
+    gallery_urls_dist = distribute(gallery_img_urls, gallery_slots)
+
+    # ── Call Anthropic API to generate content ───────────────
+    anthropic_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not anthropic_key:
+        return jsonify({'error': 'ANTHROPIC_API_KEY not set in environment'}), 500
+
+    keywords_str = ', '.join(top_keywords)
+    sku_details  = '\n'.join([f'SKU {i+1}: {sku_ids[i]} (Pack of {sku_rows[i]})' for i in range(num_skus)])
+
+    sku_details_list = []
+    for i in range(num_skus):
+        pack = sku_rows[i]
+        if pack == 1:
+            pack_label = 'PACK_OF_1'
+        else:
+            pack_label = f'PACK_OF_{pack}'
+        sku_details_list.append(f'SKU {i+1}: {sku_ids[i]} | {pack_label}')
+    sku_details = '\n'.join(sku_details_list)
+
+    prompt = f"""You are a Flipkart product listing expert. Generate listing content for {num_skus} SKUs.
+
+Product info: {description_raw}
+Top keywords to use: {keywords_str}
+SKUs:
+{sku_details}
+
+STRICT RULES for model_name:
+1. Length: exactly 70-80 characters including spaces.
+2. Do NOT include the brand name — Flipkart adds it automatically.
+3. For PACK_OF_1 SKUs: do NOT mention pack size at all (no "1 Pack", "Pack of 1", "Single", "1 Pc"). Use keywords + benefits only.
+4. For PACK_OF_2+: include pack size using EITHER "2 Pc" OR "2 Pack" format (pick randomly). Example: "2 Pc", "3 Pack", "4 Pc".
+5. Use 2-3 top keywords naturally. Slightly different angle per SKU.
+
+For EACH SKU also generate:
+- description: 50-100 words, benefit-focused, slightly different per SKU, use keywords naturally.
+- key_features: Exactly 4 features separated by ::
+
+Respond ONLY with a JSON array of {num_skus} objects, no markdown, no preamble:
+[
+  {{
+    "sku_index": 0,
+    "model_name": "...",
+    "description": "...",
+    "key_features": "Feature 1::Feature 2::Feature 3::Feature 4"
+  }}
+]"""
+
+    try:
+        ai_resp = _req.post(
+            'https://api.anthropic.com/v1/messages',
+            headers={
+                'x-api-key': anthropic_key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            json={
+                'model': 'claude-sonnet-4-5',
+                'max_tokens': 4096,
+                'messages': [{'role': 'user', 'content': prompt}]
+            },
+            timeout=60
+        )
+        if ai_resp.status_code != 200:
+            return jsonify({'error': f'Anthropic API error {ai_resp.status_code}: {ai_resp.text[:200]}'}), 500
+
+        ai_text = ai_resp.json()['content'][0]['text'].strip()
+        # Strip any markdown fences if present
+        if ai_text.startswith('```'):
+            ai_text = ai_text.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+        ai_content = _json.loads(ai_text)
+
+    except Exception as e:
+        return jsonify({'error': f'Content generation failed: {e}'}), 500
+
+    # ── Load and fill the template ───────────────────────────
+    wb = load_workbook(_io.BytesIO(template_bytes))
+
+    # Identify the category sheet (3rd-ish sheet, not a known utility sheet)
+    SKIP_SHEETS = {'Summary Sheet', 'Index', 'DropDownValuesForColumn27', 'DropDownValuesForColumn33',
+                   'Listing FAQ Sheet', 'Image GuideLines', 'MatchingAttributes',
+                   'VariantAttributes', 'Parent Variant Products', 'template_version'}
+    category_sheet = None
+    for name in wb.sheetnames:
+        if name not in SKIP_SHEETS:
+            category_sheet = name
+            break
+
+    if not category_sheet:
+        return jsonify({'error': 'Could not identify category sheet in template'}), 400
+
+    ws = wb[category_sheet]
+
+    # Build column name → index map from row 1
+    col_map = {}
+    unfilled_blue = []
+    BLUE   = 'FF8DB4E2'
+    PURPLE = 'FFCC99FF'
+    GREEN  = 'FF94D050'
+    GREEN_FILL = {'Other Image URL 1', 'Other Image URL 2', 'Other Image URL 3', 'Other Image URL 4', 'Description', 'Key Features'}
+
+    for col in range(1, ws.max_column + 1):
+        cell  = ws.cell(row=1, column=col)
+        hdr   = cell.value
+        if not hdr: continue
+        fill  = cell.fill
+        color = fill.fgColor.rgb if fill and fill.fgColor and fill.fgColor.type == 'rgb' else None
+        is_blue   = color == BLUE
+        is_purple = color == PURPLE
+        is_green  = color == GREEN
+        col_map[hdr] = col
+        # Track unfilled mandatory blue columns (change 7: dynamic — anything blue not in form_data and not auto-filled)
+        AUTO_HANDLED = {
+            'Flipkart Product Link', 'Flipkart Serial Number', 'Catalog QC Status',
+            'QC Failed Reason (if any)', 'Product Data Status', 'Disapproval Reason (if any)',
+            'Seller SKU ID', 'Listing Status', 'MRP (INR)', 'Your selling price (INR)',
+            'Fullfilment by', 'Procurement type', 'Procurement SLA (DAY)', 'Stock',
+            'Shipping provider', 'Local handling fee (INR)', 'Zonal handling fee (INR)',
+            'National handling fee (INR)', 'Length (CM)', 'Breadth (CM)', 'Height (CM)',
+            'Weight (KG)', 'HSN', 'Country Of Origin', 'Manufacturer Details',
+            'Packer Details', 'Importer Details', 'Tax Code', 'Brand', 'Ideal For',
+            'Ingredient Type', 'Type', 'Minimum Age (Month)', 'Maximum Age (Month)',
+            'Model Name', 'Quantity', 'Quantity - Measuring Unit', 'Pack of',
+            'Main Image URL', 'Other Image URL 1', 'Other Image URL 2',
+            'Other Image URL 3', 'Other Image URL 4', 'Description', 'Key Features',
+            'Search Keywords', 'Items Included',
+        }
+        dynamic_provided = set(fd.get('dynamic_fields', {}).keys())
+        if is_blue and hdr not in AUTO_HANDLED and hdr not in dynamic_provided:
+            unfilled_blue.append(hdr)
+
+    def set_cell(row, col_name, value):
+        if col_name in col_map:
+            ws.cell(row=row, column=col_map[col_name]).value = value
+
+    # ── Write rows starting at row 5 ────────────────────────
+    search_kw_str = '::'.join(top_keywords)
+
+    for i, pack_size in enumerate(sku_rows):
+        row      = 5 + i
+        ai       = ai_content[i]
+        qty_val  = pack_size * 30  # base 30g per unit (toothpaste default; works generically)
+
+        # Fixed fields
+        set_cell(row, 'Seller SKU ID',           sku_ids[i])
+        set_cell(row, 'Listing Status',           'Active')
+        set_cell(row, 'MRP (INR)',                random.randint(int(mrp_min), int(mrp_max)))
+        set_cell(row, 'Your selling price (INR)', random.randint(int(price_min), int(price_max)))
+        set_cell(row, 'Fullfilment by',           'Seller')
+        set_cell(row, 'Procurement type',         'Express')
+        set_cell(row, 'Procurement SLA (DAY)',    1)
+        set_cell(row, 'Stock',                    500)
+        set_cell(row, 'Shipping provider',        'Flipkart')
+        set_cell(row, 'Local handling fee (INR)', 0)
+        set_cell(row, 'Zonal handling fee (INR)', 0)
+        set_cell(row, 'National handling fee (INR)', 0)
+        set_cell(row, 'Length (CM)',  round(random.uniform(len_min, len_max), 2))
+        set_cell(row, 'Breadth (CM)', round(random.uniform(bre_min, bre_max), 2))
+        set_cell(row, 'Height (CM)',  round(random.uniform(hei_min, hei_max), 2))
+        set_cell(row, 'Weight (KG)',  round(random.uniform(wgt_min, min(wgt_max, 0.49)), 3))
+        set_cell(row, 'HSN',                      hsn)
+        set_cell(row, 'Country Of Origin',        country)
+        set_cell(row, 'Manufacturer Details',     manufacturer)
+        set_cell(row, 'Packer Details',           packer)
+        set_cell(row, 'Importer Details',         importer)
+        set_cell(row, 'Tax Code',                 tax_code)
+        set_cell(row, 'Brand',                    brand)
+        set_cell(row, 'Ideal For',                ideal_for)
+        set_cell(row, 'Ingredient Type',          ingredient_type)
+        set_cell(row, 'Type',                     product_type)
+        set_cell(row, 'Minimum Age (Month)',      int(min_age) if min_age else None)
+        set_cell(row, 'Maximum Age (Month)',      int(max_age) if max_age else None)
+        set_cell(row, 'Pack of',                  pack_size)
+        set_cell(row, 'Quantity',                 qty_val)
+        set_cell(row, 'Quantity - Measuring Unit','g')
+        set_cell(row, 'Items Included',           f'{pack_size} x {product_name}')
+        if mfg_date:
+            set_cell(row, 'Manufacturing date',   mfg_date)
+        if shelf_life:
+            set_cell(row, 'Shelf Life (MONTHS)',  int(shelf_life))
+            set_cell(row, 'Max Shelf Life',       int(shelf_life))
+            set_cell(row, 'Max Shelf Life - Measuring Unit', 'Months')
+
+        # Images — use pack-specific main image pool
+        pack_urls = main_urls_by_pack.get(pack_size, [])
+        main_url  = pack_urls[i % len(pack_urls)] if pack_urls else ''
+        set_cell(row, 'Main Image URL',      main_url)
+        set_cell(row, 'Other Image URL 1',   gallery_urls_dist[i * 4])
+        set_cell(row, 'Other Image URL 2',   gallery_urls_dist[i * 4 + 1])
+        set_cell(row, 'Other Image URL 3',   gallery_urls_dist[i * 4 + 2])
+        set_cell(row, 'Other Image URL 4',   gallery_urls_dist[i * 4 + 3])
+
+        # Claude-generated content
+        set_cell(row, 'Model Name',          ai['model_name'])
+        set_cell(row, 'Description',         ai['description'])
+        set_cell(row, 'Key Features',        ai['key_features'])
+        set_cell(row, 'Search Keywords',     search_kw_str)
+
+        # Model Number if present
+        if 'Model Number' in col_map and top_keywords:
+            set_cell(row, 'Model Number', random.choice(top_keywords))
+
+    # ── Change 7: Write dynamic (category-specific) fields ──────
+    dynamic_fields_data = fd.get('dynamic_fields', {})
+    for field_name, field_value in dynamic_fields_data.items():
+        if field_value and field_name in col_map:
+            for i in range(num_skus):
+                set_cell(5 + i, field_name, field_value)
+
+    # ── Save and return ──────────────────────────────────────
+    out_buf = _io.BytesIO()
+    wb.save(out_buf)
+    out_buf.seek(0)
+
+    # Sanitise filename
+    safe_name = original_filename if original_filename.endswith('.xlsx') else original_filename + '.xlsx'
+
+    return send_file(
+        out_buf,
+        as_attachment=True,
+        download_name=safe_name,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    ), 200, {'X-Unfilled-Fields': _json.dumps(unfilled_blue)}
+
 
 # ─────────────────────────────────────────────
-# FLIPKART API — CLIENT CREDENTIALS (no redirect URI needed)
+# LISTING GENERATOR
 # ─────────────────────────────────────────────
-import requests as _requests
-import time as _time
 
-_FK_CLIENT_ID     = os.environ.get('FLIPKART_CLIENT_ID', '')
-_FK_CLIENT_SECRET = os.environ.get('FLIPKART_CLIENT_SECRET', '')
+_LG_OUTPUT_DIR = os.path.join(_data_dir, 'lg_outputs')
+os.makedirs(_LG_OUTPUT_DIR, exist_ok=True)
 
-FLIPKART_ACCOUNTS = {
-    "cutestclub": {"client_id": _FK_CLIENT_ID, "client_secret": _FK_CLIENT_SECRET},
-    "eonspark":   {
-        "client_id":     os.environ.get('EONSPARK_CLIENT_ID', ''),
-        "client_secret": os.environ.get('EONSPARK_CLIENT_SECRET', ''),
-    },
+def _upload_to_imgbb(image_bytes, filename):
+    """Upload image bytes to ImgBB anonymous upload. Returns public URL or raises."""
+    import urllib.request as _ur, urllib.parse as _up
+    import base64 as _b64
+    # ImgBB free anonymous upload (no API key needed for basic use)
+    # Uses the public upload endpoint
+    IMGBB_API = 'https://api.imgbb.com/1/upload'
+    api_key   = os.environ.get('IMGBB_API_KEY', '')
+    b64_data  = _b64.b64encode(image_bytes).decode()
+    if api_key:
+        payload = _up.urlencode({'key': api_key, 'image': b64_data, 'name': filename}).encode()
+    else:
+        # Anonymous upload via freeimagehost fallback — use catbox.moe
+        # catbox.moe supports anonymous uploads via multipart
+        import io as _io
+        boundary = 'boundary1234567890'
+        body = (
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="reqtype"\r\n\r\n'
+            f'fileupload\r\n'
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="fileToUpload"; filename="{filename}"\r\n'
+            f'Content-Type: image/jpeg\r\n\r\n'
+        ).encode() + image_bytes + f'\r\n--{boundary}--\r\n'.encode()
+        req = _ur.Request('https://catbox.moe/user/api.php', data=body,
+                          headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
+        try:
+            resp = _ur.urlopen(req, timeout=20)
+            url  = resp.read().decode().strip()
+            if url.startswith('http'): return url
+        except Exception as e:
+            raise RuntimeError(f'Image upload failed: {e}')
+        raise RuntimeError('Image upload returned unexpected response')
+    if api_key:
+        req  = _ur.Request(IMGBB_API, data=payload,
+                           headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        try:
+            resp = _ur.urlopen(req, timeout=20)
+            data = json.loads(resp.read())
+            return data['data']['url']
+        except Exception as e:
+            raise RuntimeError(f'ImgBB upload failed: {e}')
+
+
+def _rand_int(mn, mx):
+    import random
+    mn, mx = int(mn), int(mx)
+    if mn > mx: mn, mx = mx, mn
+    return random.randint(mn, mx)
+
+def _rand_float(mn, mx, dp=2):
+    import random
+    mn, mx = float(mn), float(mx)
+    if mn > mx: mn, mx = mx, mn
+    return round(random.uniform(mn, mx), dp)
+
+_RANDOM_PREFIXES = [
+    'Aero','Bolt','Calm','Dusk','Echo','Flux','Glen','Halo','Iris','Jade',
+    'Kite','Lume','Mira','Nova','Onyx','Plex','Quro','Reef','Sola','Tide',
+    'Urve','Vibe','Wren','Xeno','Yore','Zest','Arch','Brim','Cove','Dawn',
+    'Edge','Fern','Glow','Haze','Isle','Just','Keen','Lark','Mist','Norm',
+    'Opal','Pine','Quay','Rune','Sage','Tuft','Unix','Vale','Ward','Xtra',
+]
+
+def _gen_sku_prefix():
+    import random
+    return random.choice(_RANDOM_PREFIXES)
+
+def _distribute_evenly(items, n):
+    """Distribute `items` list across n slots as evenly as possible."""
+    import random
+    result = []
+    for i in range(n):
+        result.append(items[i % len(items)])
+    random.shuffle(result)
+    return result
+
+def _detect_category_sheet(wb):
+    """Find the category/vertical sheet (not Summary, Index, DropDown*, etc.)"""
+    skip = {'summary sheet', 'index', 'listing faq sheet', 'image guidelines',
+            'matchingattributes', 'variantattributes', 'parent variant products',
+            'template_version'}
+    for name in wb.sheetnames:
+        if name.lower().startswith('dropdown'): continue
+        if name.lower() in skip: continue
+        return name
+    return wb.sheetnames[2] if len(wb.sheetnames) > 2 else wb.sheetnames[0]
+
+def _get_col_colors(ws):
+    """
+    Return dict: col_index (1-based) -> {'header': str, 'color': str}
+    Colors: blue=8DB4E2, purple=CC99FF, green=94D050, grey=C0C0C0
+    """
+    cols = {}
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=col)
+        if not cell.value:
+            continue
+        fill  = cell.fill
+        color = ''
+        if fill and fill.fgColor and fill.fgColor.type == 'rgb':
+            color = fill.fgColor.rgb[-6:].upper()  # strip alpha
+        cols[col] = {'header': str(cell.value).strip(), 'color': color}
+    return cols
+
+def _col_by_header(col_map, header_name):
+    """Find column index by header string (case-insensitive partial match)."""
+    hn = header_name.lower()
+    for idx, info in col_map.items():
+        if info['header'].lower() == hn:
+            return idx
+    return None
+
+BLUE   = '8DB4E2'
+PURPLE = 'CC99FF'
+GREEN  = '94D050'
+GREY   = 'C0C0C0'
+
+# Columns we explicitly fill (blue+purple, and 6 green ones)
+_FILL_GREEN_HEADERS = {
+    'other image url 1', 'other image url 2', 'other image url 3', 'other image url 4',
+    'description', 'key features',
+}
+# Blue columns we skip (Flipkart fills them)
+_SKIP_BLUE_HEADERS = {
+    'flipkart serial number', 'catalog qc status', 'qc failed reason (if any)',
 }
 
-FK_TOKEN_DIR = _data_dir
+def _generate_ai_content(n_skus, sku_identifier, keywords_list, desc_content,
+                          pack_assignments, brand):
+    """Call Claude API to generate titles, descriptions, and key features for all SKUs."""
+    import requests as _req
 
-def _fk_token_path(account):
-    return os.path.join(FK_TOKEN_DIR, f'fk_token_{account}.json')
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not api_key:
+        raise RuntimeError('ANTHROPIC_API_KEY not set in Railway env vars')
 
-def _fk_fetch_token(account):
-    """Fetch a fresh token using client_credentials GET + Basic auth (Flipkart FMS API spec)."""
-    creds = FLIPKART_ACCOUNTS.get(account)
-    if not creds:
-        raise ValueError(f"Unknown account: {account}")
-    import base64 as _b64
-    credentials = _b64.b64encode(f"{creds['client_id']}:{creds['client_secret']}".encode()).decode()
-    resp = _requests.get(
-        "https://api.flipkart.net/oauth-service/oauth/token"
-        "?grant_type=client_credentials&scope=Seller_Api",
-        headers={"Authorization": f"Basic {credentials}"},
-        timeout=15,
+    kw_str = ', '.join(keywords_list)
+    pack_info = ', '.join([f'SKU {i+1}: Pack-{p}' for i, p in enumerate(pack_assignments)])
+
+    prompt = f"""You are an expert Flipkart product listing copywriter. Generate listing content for {n_skus} SKUs of "{sku_identifier}" by brand "{brand}".
+
+Top keywords to optimise for (use naturally): {kw_str}
+Pack assignments: {pack_info}
+Product info: {desc_content}
+
+Generate a JSON object with this exact structure:
+{{
+  "skus": [
+    {{
+      "model_name": "...",
+      "description": "...",
+      "key_features": "Feature 1::Feature 2::Feature 3::Feature 4",
+      "search_keywords": "kw1::kw2::kw3::kw4::kw5"
+    }}
+  ]
+}}
+
+Rules:
+- model_name: 70-80 characters including spaces. Must contain the brand name and 2-3 top keywords. Each SKU title should have slight variation in word order or angle. Include pack size naturally (e.g. "Pack of 2", "Combo 2Pc").
+- description: 50-100 words. Unique angle per SKU. Use keywords naturally. Professional tone.
+- key_features: Exactly 4 features separated by "::". Each feature is a short punchy phrase (5-10 words). Vary across SKUs.
+- search_keywords: 5 keywords from the top keywords list separated by "::"
+- Return ONLY the JSON object. No markdown, no explanation."""
+
+    resp = _req.post(
+        'https://api.anthropic.com/v1/messages',
+        headers={
+            'x-api-key': api_key,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json',
+        },
+        json={
+            'model': 'claude-sonnet-4-5',
+            'max_tokens': 4000,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=60
     )
-    resp.raise_for_status()
-    token_data = resp.json()
-    if 'access_token' not in token_data:
-        raise RuntimeError(f"Token fetch failed: {token_data}")
-    token_data['connected_at'] = datetime.datetime.now(tz=IST).isoformat()
-    token_data['fetched_at_ts'] = _time.time()
-    with open(_fk_token_path(account), 'w') as f:
-        json.dump(token_data, f)
-    return token_data
+    if resp.status_code != 200:
+        raise RuntimeError(f'Claude API error {resp.status_code}: {resp.text[:200]}')
 
-def fk_get_token(account):
-    """Return a valid access token, auto-refreshing 5 min before expiry."""
-    token_path = _fk_token_path(account)
-    if os.path.exists(token_path):
-        try:
-            with open(token_path) as f:
-                t = json.load(f)
-            expires_in = int(t.get('expires_in', 3600))
-            fetched_at = float(t.get('fetched_at_ts', 0))
-            if _time.time() < fetched_at + expires_in - 300:
-                return t['access_token']
-        except Exception:
-            pass
-    return _fk_fetch_token(account)['access_token']
+    raw = resp.json()['content'][0]['text'].strip()
+    # Strip markdown fences if any
+    if raw.startswith('```'):
+        raw = raw.split('```')[1]
+        if raw.startswith('json'): raw = raw[4:]
+    data = json.loads(raw.strip())
+    return data['skus']
 
-@app.route('/flipkart/connect/<account>')
-def flipkart_connect(account):
-    """Get a Flipkart token using client_credentials — no portal redirect URI needed."""
-    account = account.lower()
-    if account not in FLIPKART_ACCOUNTS:
-        return f"Unknown account: {account}. Known: {list(FLIPKART_ACCOUNTS.keys())}", 404
-    if not FLIPKART_ACCOUNTS[account]['client_id']:
-        return "FLIPKART_CLIENT_ID environment variable not set on Railway.", 500
+
+@app.route('/api/listing-generate', methods=['POST'])
+def listing_generate():
+    """
+    Receive form data + files, generate filled XLSX listing template.
+    Steps:
+    1. Upload all images to catbox.moe
+    2. Generate AI content via Claude
+    3. Fill XLSX and save to lg_outputs dir
+    4. Return filename for download
+    """
     try:
-        _fk_fetch_token(account)
-        return (
-            f"<h2>Connected!</h2>"
-            f"<p>Account <b>{account}</b> is now linked to Flipkart API.</p>"
-            f"<p><a href='/flipkart/status'>Check status</a></p>"
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import random
+        from openpyxl import load_workbook
+        from io import BytesIO
 
-@app.route('/flipkart/status')
-def flipkart_status():
-    statuses = {}
-    for account in FLIPKART_ACCOUNTS:
-        token_path = _fk_token_path(account)
-        if os.path.exists(token_path):
-            try:
-                with open(token_path) as f:
-                    t = json.load(f)
-                statuses[account] = {
-                    "status":       "connected",
-                    "connected_at": t.get("connected_at", "unknown"),
-                    "expires_in":   t.get("expires_in", "unknown"),
-                }
-            except Exception:
-                statuses[account] = {"status": "token_corrupt"}
-        else:
-            statuses[account] = {
-                "status":      "not_connected",
-                "connect_url": f"https://wynx.up.railway.app/flipkart/connect/{account}",
-            }
-    return jsonify(statuses)
+        # ── Parse inputs ──
+        def gi(k, default=''): return request.form.get(k, default).strip()
+        n_skus      = int(gi('n_skus', '0'))
+        sku_ident   = gi('sku_identifier')
+        keywords    = [k.strip() for k in gi('keywords').split(',') if k.strip()]
+        desc        = gi('desc_content')
+        mrp_min, mrp_max = int(gi('mrp_min','100')), int(gi('mrp_max','200'))
+        sp_min,  sp_max  = int(gi('sp_min','80')),   int(gi('sp_max','180'))
+        len_min, len_max = int(gi('len_min','5')),    int(gi('len_max','15'))
+        br_min,  br_max  = int(gi('br_min','5')),     int(gi('br_max','15'))
+        ht_min,  ht_max  = int(gi('ht_min','5')),     int(gi('ht_max','20'))
+        wt_min,  wt_max  = float(gi('wt_min','0.1')), min(float(gi('wt_max','0.4')), 0.49)
+        hsn         = gi('hsn')
+        country     = gi('country','India')
+        manufacturer= gi('manufacturer')
+        packer      = gi('packer')
+        importer    = gi('importer','')
+        tax_code    = gi('tax_code','GST_5')
+        brand       = gi('brand')
+        pack_counts = {i: int(gi(f'pack{i}','0')) for i in range(1,6)}
+
+        # Build pack assignment list: [1,1,1,2,2] etc.
+        pack_assignments = []
+        for pack_size, count in pack_counts.items():
+            pack_assignments.extend([pack_size] * count)
+        random.shuffle(pack_assignments)
+
+        # ── Template file ──
+        tmpl_file = request.files.get('template')
+        if not tmpl_file:
+            return jsonify({'error': 'No template file uploaded'}), 400
+        orig_filename = tmpl_file.filename
+        tmpl_bytes = tmpl_file.read()
+
+        # ── Upload images ──
+        main_files    = request.files.getlist('main_images')
+        gallery_files = request.files.getlist('gallery_images')
+
+        def upload_files(file_list):
+            urls = []
+            for f in file_list:
+                data = f.read()
+                url  = _upload_to_imgbb(data, f.filename)
+                urls.append(url)
+            return urls
+
+        main_urls    = upload_files(main_files)
+        gallery_urls = upload_files(gallery_files)
+
+        # Distribute main images evenly across SKUs
+        main_assigned    = _distribute_evenly(main_urls, n_skus)
+        # For gallery: assign 4 per SKU by picking randomly
+        gallery_assigned = []
+        for i in range(n_skus):
+            picks = []
+            pool  = gallery_urls[:]
+            random.shuffle(pool)
+            for j in range(4):
+                picks.append(pool[j % len(pool)])
+            gallery_assigned.append(picks)
+
+        # ── Generate AI content ──
+        ai_skus = _generate_ai_content(n_skus, sku_ident, keywords, desc,
+                                        pack_assignments, brand)
+
+        # ── Load and fill XLSX ──
+        wb  = load_workbook(BytesIO(tmpl_bytes))
+        cat_sheet = _detect_category_sheet(wb)
+        ws  = wb[cat_sheet]
+        col_map = _get_col_colors(ws)
+
+        # Find which blue cols are NOT handled (for warnings)
+        handled_headers = {
+            'seller sku id', 'listing status', 'mrp (inr)', 'your selling price (inr)',
+            'fullfilment by', 'procurement type', 'procurement sla (day)', 'stock',
+            'shipping provider', 'local handling fee (inr)', 'zonal handling fee (inr)',
+            'national handling fee (inr)', 'length (cm)', 'breadth (cm)', 'height (cm)',
+            'weight (kg)', 'hsn', 'country of origin', 'manufacturer details',
+            'packer details', 'importer details', 'tax code', 'brand',
+            'quantity', 'quantity - measuring unit', 'pack of', 'items included',
+            'main image url', 'other image url 1', 'other image url 2',
+            'other image url 3', 'other image url 4', 'model name', 'model number',
+            'description', 'key features', 'search keywords',
+            'ideal for', 'ingredient type', 'type', 'minimum age (month)',
+            'maximum age (month)', 'shelf life (months)', 'max shelf life',
+            'max shelf life - measuring unit', 'flavor', 'fluorodine',
+            'applied for', 'vegetarian', 'certification',
+        }
+        warnings = []
+        for idx, info in col_map.items():
+            if info['color'] in (BLUE, PURPLE):
+                hdr = info['header'].lower()
+                if hdr in _SKIP_BLUE_HEADERS: continue
+                if info['header'].lower() == 'flipkart product link': continue
+                if hdr not in handled_headers:
+                    warnings.append(info['header'])
+
+        # Helper: find col index by header
+        def col(name):
+            return _col_by_header(col_map, name)
+
+        data_row_start = 5  # rows 1-4 are header/instructions
+        for i in range(n_skus):
+            row   = data_row_start + i
+            pack  = pack_assignments[i]
+            ai    = ai_skus[i] if i < len(ai_skus) else ai_skus[-1]
+            prefix = _gen_sku_prefix()
+            sku_id = f'{prefix} {sku_ident} {pack} Pack'
+
+            def s(header, value):
+                c_idx = col(header)
+                if c_idx: ws.cell(row=row, column=c_idx, value=value)
+
+            s('Seller SKU ID',             sku_id)
+            s('Listing Status',            'Active')
+            s('MRP (INR)',                 _rand_int(mrp_min, mrp_max))
+            s('Your selling price (INR)',  _rand_int(sp_min, sp_max))
+            s('Fullfilment by',            'Seller')
+            s('Procurement type',          'express')
+            s('Procurement SLA (DAY)',     1)
+            s('Stock',                     500)
+            s('Shipping provider',         'Flipkart')
+            s('Local handling fee (INR)',  0)
+            s('Zonal handling fee (INR)',  0)
+            s('National handling fee (INR)', 0)
+            s('Length (CM)',               _rand_int(len_min, len_max))
+            s('Breadth (CM)',              _rand_int(br_min, br_max))
+            s('Height (CM)',               _rand_int(ht_min, ht_max))
+            # Weight: random float between min and max, capped at 0.49
+            wt = round(random.uniform(wt_min, wt_max), 2)
+            s('Weight (KG)',               wt)
+            s('HSN',                       hsn)
+            s('Country Of Origin',         country)
+            s('Manufacturer Details',      manufacturer)
+            s('Packer Details',            packer)
+            if importer: s('Importer Details', importer)
+            s('Tax Code',                  tax_code)
+            s('Brand',                     brand)
+            s('Pack of',                   pack)
+            s('Quantity',                  pack)   # same as pack size (units)
+            s('Quantity - Measuring Unit', 'g')
+            s('Items Included',            f'{pack} x {sku_ident}')
+            s('Model Name',               ai.get('model_name', ''))
+            # Model Number — use first keyword if col exists
+            if col('Model Number'):
+                s('Model Number', keywords[i % len(keywords)])
+            s('Main Image URL',            main_assigned[i])
+            gal = gallery_assigned[i]
+            for gi_idx, gal_col in enumerate(['Other Image URL 1','Other Image URL 2',
+                                               'Other Image URL 3','Other Image URL 4'], 0):
+                if gi_idx < len(gal): s(gal_col, gal[gi_idx])
+            s('Description',              ai.get('description', ''))
+            s('Key Features',             ai.get('key_features', ''))
+            s('Search Keywords',          ai.get('search_keywords', ''))
+
+            # Category-specific constants (toothpaste & common health products)
+            s('Ideal For',                'Men & Women')
+            s('Ingredient Type',          'Herbal')
+            s('Minimum Age (Month)',       3)
+            s('Maximum Age (Month)',       70)
+
+        # Save output
+        safe_name = re.sub(r'[^A-Za-z0-9_.\-]', '_', orig_filename)
+        out_path  = os.path.join(_LG_OUTPUT_DIR, safe_name)
+        wb.save(out_path)
+
+        return jsonify({
+            'ok':        True,
+            'filename':  safe_name,
+            'n_skus':    n_skus,
+            'warnings':  warnings,
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/listing-download/<filename>')
+def listing_download(filename):
+    """Serve the generated XLSX file."""
+    # Sanitise
+    safe = re.sub(r'[^A-Za-z0-9_.\-]', '_', filename)
+    path = os.path.join(_LG_OUTPUT_DIR, safe)
+    if not os.path.exists(path):
+        return 'File not found', 404
+    return send_file(path, as_attachment=True, download_name=filename)
+
 
 @app.route('/api/category-investigate')
 def category_investigate():
     """
-    Run the Flipkart category attribute investigation for Body & Skin Care / Foot Care.
-    Uses EONSPARK account. Returns full category tree + attributes as JSON.
+    Flipkart category attribute investigator for Body/Skin/Foot Care.
+    Uses EONSPARK account (FK_EONSPARK_APP_ID / FK_EONSPARK_APP_SECRET).
     Query params:
-      ?account=eonspark (default)
-      ?keywords=foot,skin,body (comma-separated, default: foot,body,skin,health,personal,care)
+      ?account=EONSPARK  (default)
+      ?keywords=foot,skin,body  (comma-separated)
+    Returns JSON with full category tree, matched categories, and per-category attributes
+    with SEO field detection.
     """
-    account = request.args.get('account', 'eonspark').lower()
-    if account not in FLIPKART_ACCOUNTS:
-        return jsonify({"error": f"Unknown account '{account}'. Known: {list(FLIPKART_ACCOUNTS.keys())}"}), 400
-    if not FLIPKART_ACCOUNTS[account]['client_id']:
-        return jsonify({"error": f"Credentials for '{account}' not set. Add {account.upper()}_CLIENT_ID and {account.upper()}_CLIENT_SECRET to Railway env vars."}), 500
+    import requests as _req
 
-    FK_API = "https://api.flipkart.net/sellers"
-    keywords_param = request.args.get('keywords', 'foot,body,skin,health,personal,care')
-    search_keywords = [k.strip() for k in keywords_param.split(',') if k.strip()]
+    account  = request.args.get('account', 'EONSPARK').upper()
+    kw_param = request.args.get('keywords', 'foot,body,skin,health,personal,care')
+    keywords = [k.strip() for k in kw_param.split(',') if k.strip()]
 
     try:
         token = fk_get_token(account)
-    except Exception as e:
-        return jsonify({"error": f"Token fetch failed: {e}"}), 502
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
 
-    def fk_get(path, params=None):
-        r = _requests.get(
-            f"{FK_API}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=20,
-        )
-        return {"status": r.status_code, "body": r.json() if r.headers.get('content-type','').startswith('application/json') else r.text}
+    FK_API  = 'https://api.flipkart.net/sellers'
+    headers = {'Authorization': f'Bearer {token}'}
 
-    def find_categories(cats, keyword):
-        results = []
+    def fk_get(path):
+        r = _req.get(f'{FK_API}{path}', headers=headers, timeout=20)
+        body = r.json() if 'application/json' in r.headers.get('content-type', '') else r.text
+        return r.status_code, body
+
+    def find_in_tree(cats, kw):
+        hits = []
         for cat in (cats if isinstance(cats, list) else []):
-            name = (cat.get("displayName") or cat.get("name") or "").lower()
-            if keyword.lower() in name:
-                results.append(cat)
-            children = cat.get("children") or cat.get("subCategories") or []
-            results.extend(find_categories(children, keyword))
-        return results
+            name = (cat.get('displayName') or cat.get('name') or '').lower()
+            if kw in name:
+                hits.append(cat)
+            hits.extend(find_in_tree(cat.get('children') or cat.get('subCategories') or [], kw))
+        return hits
 
-    def collect_target_ids(cats, target_kws, depth=0):
+    def collect_targets(cats, kws, depth=0):
         found = []
         for cat in (cats if isinstance(cats, list) else []):
-            name = (cat.get("displayName") or cat.get("name") or "").lower()
-            cat_id = cat.get("id") or cat.get("categoryId") or ""
-            if any(kw in name for kw in target_kws) and cat_id:
-                found.append({"name": name, "id": cat_id, "depth": depth})
-            children = cat.get("children") or cat.get("subCategories") or []
-            found.extend(collect_target_ids(children, target_kws, depth + 1))
+            name   = (cat.get('displayName') or cat.get('name') or '').lower()
+            cat_id = cat.get('id') or cat.get('categoryId') or ''
+            if any(kw in name for kw in kws) and cat_id:
+                found.append({'name': name, 'id': cat_id, 'depth': depth})
+            found.extend(collect_targets(cat.get('children') or cat.get('subCategories') or [], kws, depth + 1))
         return found
 
-    # 1. Fetch category tree
-    cats_resp = fk_get("/skus/categories")
-    if cats_resp["status"] != 200:
-        return jsonify({"error": "Failed to fetch categories", "detail": cats_resp}), 502
-    cats = cats_resp["body"]
+    # 1. Category tree
+    status, cats = fk_get('/skus/categories')
+    if status != 200:
+        return jsonify({'error': 'Category tree fetch failed', 'http_status': status, 'detail': cats}), 502
 
-    # 2. Find matching categories
+    # 2. Keyword matches
     keyword_matches = {}
-    for kw in search_keywords:
-        matches = find_categories(cats, kw)
-        if matches:
+    for kw in keywords:
+        hits = find_in_tree(cats, kw)
+        if hits:
             keyword_matches[kw] = [
-                {"name": c.get("displayName") or c.get("name"), "id": c.get("id") or c.get("categoryId")}
-                for c in matches[:8]
+                {'name': c.get('displayName') or c.get('name'), 'id': c.get('id') or c.get('categoryId')}
+                for c in hits[:8]
             ]
 
-    # 3. Collect target category IDs to probe
-    target_cats = collect_target_ids(cats, search_keywords)[:15]  # cap at 15
+    # 3. Target categories to probe (cap at 15)
+    targets = collect_targets(cats, keywords)[:15]
 
-    # 4. Fetch attributes for each target category
-    SEO_FLAGS = {"keyword", "search", "highlight", "tag", "description", "bullet", "feature", "benefit", "meta"}
-    attributes_by_category = {}
-    for cat_info in target_cats:
-        attrs_resp = fk_get(f"/skus/categories/{cat_info['id']}/attributes")
-        attrs = attrs_resp["body"]
+    # 4. Fetch attributes per target
+    SEO_FLAGS = {'keyword', 'search', 'highlight', 'tag', 'description', 'bullet', 'feature', 'benefit', 'meta'}
+    attrs_by_cat = {}
+    for cat in targets:
+        s, attrs = fk_get(f"/skus/categories/{cat['id']}/attributes")
         parsed = []
         if isinstance(attrs, list):
-            for attr in attrs:
-                attr_name = attr.get("name", "")
-                is_seo = any(f in attr_name.lower() for f in SEO_FLAGS)
+            for a in attrs:
+                nm     = a.get('name', '')
+                is_seo = any(f in nm.lower() for f in SEO_FLAGS)
                 parsed.append({
-                    "name":      attr_name,
-                    "type":      attr.get("type") or attr.get("dataType", ""),
-                    "mandatory": attr.get("mandatory") or attr.get("required", False),
-                    "seo_field": is_seo,
-                    "values":    (attr.get("values") or attr.get("allowedValues") or [])[:20],
+                    'name':      nm,
+                    'type':      a.get('type') or a.get('dataType', ''),
+                    'mandatory': bool(a.get('mandatory') or a.get('required')),
+                    'seo_field': is_seo,
+                    'values':    (a.get('values') or a.get('allowedValues') or [])[:20],
                 })
-        attributes_by_category[cat_info["name"]] = {
-            "category_id": cat_info["id"],
-            "http_status": attrs_resp["status"],
-            "attributes":  parsed,
-            "seo_fields":  [a["name"] for a in parsed if a["seo_field"]],
+        attrs_by_cat[cat['name']] = {
+            'category_id': cat['id'],
+            'http_status': s,
+            'attributes':  parsed,
+            'seo_fields':  [a['name'] for a in parsed if a['seo_field']],
         }
 
     return jsonify({
-        "account":              account,
-        "categories_fetched":   len(cats) if isinstance(cats, list) else "non-list",
-        "keyword_matches":      keyword_matches,
-        "target_categories":    [c["name"] for c in target_cats],
-        "attributes_by_category": attributes_by_category,
+        'account':                account,
+        'categories_total':       len(cats) if isinstance(cats, list) else 'non-list',
+        'keyword_matches':        keyword_matches,
+        'target_categories':      [c['name'] for c in targets],
+        'attributes_by_category': attrs_by_cat,
     })
 
 
